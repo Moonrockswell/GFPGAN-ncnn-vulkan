@@ -12,12 +12,9 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Zip src folder
-        run: zip -r GFPGAN-ncnn-vulkan-src.zip src
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: GFPGAN-ncnn-vulkan-src
-          path: GFPGAN-ncnn-vulkan-src.zip
+          path: src
           retention-days: 7
