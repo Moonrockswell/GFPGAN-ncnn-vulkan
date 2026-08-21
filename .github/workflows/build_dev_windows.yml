@@ -51,3 +51,8 @@ jobs:
         mkdir build; cd build
         cmake -A x64 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" ../src
         cmake --build . --config Release -j 2
+    - name: upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.APPLICATION_NAME }}-windows
+        path: build/*/Release/
