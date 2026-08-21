@@ -1,4 +1,9 @@
 #include <cstdio>
+#include <cstring>
+#include <cctype>
+#include <string>
+#include <vector>
+#include <filesystem>
 #include <net.h>
 #include "gfpgan.h"
 #include "face.h"
@@ -6,6 +11,97 @@
 
 #define RESTORE_WHOLE_IMAGE 1   //0-only restore face, 1-restore whole image
 #define RESTORE_IMAGE_COLOR 0   //0-no color image, 1-coloring grayscale images
+
+namespace fs = std::filesystem;
+
+// Default folder (relative to the executable / current working directory)
+// where the .param / .bin model files are expected to be found.
+static const char *DEFAULT_MODEL_DIR = "./gfpgan-models";
+
+static void print_usage(const char *progname) {
+    fprintf(stderr,
+        "Usage: %s -i infile -o outfile [options]...\n"
+        "  -h                   show this help\n"
+        "  -i input-path        input image path (jpg/png/webp) or directory\n"
+        "  -o output-path       output image path (jpg/png/webp) or directory\n"
+        "  -m model-path        folder path to the pre-trained models (default=%s)\n"
+        "  -f output format       output image format (jpg/png/webp, default=ext/png)\n"
+        "*Unmodifiable Options*\n"
+        " -s scale               upscale ratio (default=2)\n"
+        " -t tile-size           tile size (default = 400)\n"
+        " -n model name     GFPGANCleanv1-NoCE-C2 supports only one type of model\n"
+        "\n"
+        "If -o is omitted:\n"
+        "  - single file input : saved next to the input as <name>-output.<ext>\n"
+        "  - folder input       : saved into a new '<foldername>-output' subfolder\n"
+        "                          inside the input folder, original filenames kept\n",
+        progname, DEFAULT_MODEL_DIR);
+}
+
+static std::string to_lower(std::string s) {
+    for (char &c : s) c = (char) tolower((unsigned char) c);
+    return s;
+}
+
+// Returns true if fmt is one of the supported output formats.
+static bool is_supported_format(const std::string &fmt) {
+    std::string f = to_lower(fmt);
+    return f == "jpg" || f == "jpeg" || f == "png" || f == "webp";
+}
+
+// Replaces (or appends) the extension of path with the given format,
+// e.g. apply_format("result.png", "jpg") -> "result.jpg"
+static std::string apply_format(const std::string &path, const std::string &fmt) {
+    size_t slash = path.find_last_of("/\\");
+    size_t dot = path.find_last_of('.');
+    std::string base = (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+                        ? path.substr(0, dot)
+                        : path;
+    return base + "." + fmt;
+}
+
+// Default output path for a single input file when -o is not given:
+// same folder as the input, "<name>-output.<ext>" (no space before "-output").
+// Extension follows -f when given, otherwise the input file's own extension,
+// falling back to png if that extension isn't a supported image format.
+static std::string default_single_output(const std::string &inputPath, const std::string &format) {
+    fs::path p(inputPath);
+    std::string stem = p.stem().string();
+
+    std::string ext;
+    if (!format.empty()) {
+        ext = to_lower(format);
+    } else {
+        std::string inExt = p.extension().string();
+        if (!inExt.empty() && inExt[0] == '.') inExt = inExt.substr(1);
+        inExt = to_lower(inExt);
+        ext = is_supported_format(inExt) ? inExt : "png";
+    }
+
+    fs::path outPath = p.parent_path() / (stem + "-output." + ext);
+    return outPath.string();
+}
+
+// Default output folder for a directory input when -o is not given:
+// "<foldername>-output" created as a subfolder inside the input folder,
+// e.g. ./image -> ./image/image-output
+static std::string default_output_folder(const std::string &inputDir) {
+    fs::path p(inputDir);
+    std::string dirname = p.filename().string();
+    if (dirname.empty()) {
+        // handles a trailing slash, e.g. "./image/"
+        dirname = p.parent_path().filename().string();
+    }
+    fs::path outDir = p / (dirname + "-output");
+    return outDir.string();
+}
+
+static bool is_image_file(const fs::path &p) {
+    if (!fs::is_regular_file(p)) return false;
+    std::string ext = p.extension().string();
+    if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+    return is_supported_format(ext);
+}
 
 static void to_ocv(const ncnn::Mat &result, cv::Mat &out) {
     cv::Mat cv_result_32F = cv::Mat::zeros(cv::Size(512, 512), CV_32FC3);
@@ -71,30 +167,20 @@ static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &tr
 
 #endif
 
-int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s [imagepath]\n", argv[0]);
-        return -1;
-    }
-
-    const char *imagepath = argv[1];
-
-    cv::Mat img = cv::imread(imagepath, 1);
+// Runs the full restoration pipeline on a single image and writes the result.
+// Models are already loaded, so this can be called repeatedly for batch processing.
+static bool restore_one_image(GFPGAN &gfpgan,
+#if RESTORE_WHOLE_IMAGE
+                               Face &face_detector, RealESRGAN &real_esrgan,
+#endif
+                               const std::string &inputPath, const std::string &outputPath) {
+    cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
-        fprintf(stderr, "cv::imread %s failed\n", imagepath);
-        return -1;
+        fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
+        return false;
     }
-
-    GFPGAN gfpgan;
-    gfpgan.load("./models/encoder.param", "./models/encoder.bin", "./models/style.bin");
 
 #if RESTORE_WHOLE_IMAGE
-    Face face_detector;
-    face_detector.load("./models/yolov5-blazeface.param", "./models/yolov5-blazeface.bin");
-
-    RealESRGAN real_esrgan;
-    real_esrgan.load("./models/real_esrgan.param", "./models/real_esrgan.bin");
-
     cv::Mat bg_upsample;
     real_esrgan.tile_process(img, bg_upsample);
 
@@ -112,21 +198,145 @@ int main(int argc, char **argv) {
         to_ocv(gfpgan_result, restored_face);
 
         paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample);
-
     }
-    cv::imwrite("result.png", bg_upsample);
+    cv::imwrite(outputPath, bg_upsample);
 #else
     ncnn::Mat gfpgan_result;
     gfpgan.process(img, gfpgan_result);
 
     cv::Mat restored_face;
     to_ocv(gfpgan_result, restored_face);
-    cv::imwrite("result.png",restored_face);
+    cv::imwrite(outputPath, restored_face);
 #endif
 
+    return true;
+}
 
-    //cv::imshow("up", bg_upsample);
-    //cv::waitKey();
+int main(int argc, char **argv) {
+    std::string imagepath;
+    std::string outputpath;
+    std::string modeldir = DEFAULT_MODEL_DIR;
+    std::string format;
+
+    if (argc < 2) {
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    // Support Windows-style "/?" as well as -h, wherever it appears.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "/?") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+    }
+
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "-i" && i + 1 < argc) {
+            imagepath = argv[++i];
+        } else if (arg == "-o" && i + 1 < argc) {
+            outputpath = argv[++i];
+        } else if (arg == "-m" && i + 1 < argc) {
+            modeldir = argv[++i];
+        } else if (arg == "-f" && i + 1 < argc) {
+            format = argv[++i];
+        } else {
+            fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
+            print_usage(argv[0]);
+            return -1;
+        }
+    }
+
+    if (imagepath.empty()) {
+        fprintf(stderr, "Error: -i input-path is required\n\n");
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (!format.empty() && !is_supported_format(format)) {
+        fprintf(stderr, "Error: unsupported -f format '%s' (use jpg/png/webp)\n\n", format.c_str());
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (!fs::exists(imagepath)) {
+        fprintf(stderr, "Error: input path '%s' does not exist\n", imagepath.c_str());
+        return -1;
+    }
+
+    // Strip a single trailing slash/backslash so path concatenation below is clean.
+    if (!modeldir.empty() && (modeldir.back() == '/' || modeldir.back() == '\\')) {
+        modeldir.pop_back();
+    }
+
+    GFPGAN gfpgan;
+    gfpgan.load(modeldir + "/encoder.param", modeldir + "/encoder.bin", modeldir + "/style.bin");
+
+#if RESTORE_WHOLE_IMAGE
+    Face face_detector;
+    face_detector.load(modeldir + "/yolov5-blazeface.param", modeldir + "/yolov5-blazeface.bin");
+
+    RealESRGAN real_esrgan;
+    real_esrgan.load(modeldir + "/real_esrgan.param", modeldir + "/real_esrgan.bin");
+#endif
+
+    bool inputIsDir = fs::is_directory(imagepath);
+
+    if (inputIsDir) {
+        // Batch mode: process every jpg/png/webp file directly inside the folder
+        // (not recursively) and write results into an output subfolder.
+        std::string outDir = !outputpath.empty() ? outputpath : default_output_folder(imagepath);
+
+        std::error_code ec;
+        fs::create_directories(outDir, ec);
+        if (ec) {
+            fprintf(stderr, "Error: could not create output folder '%s'\n", outDir.c_str());
+            return -1;
+        }
+
+        int processed = 0;
+        for (const auto &entry : fs::directory_iterator(imagepath)) {
+            if (!is_image_file(entry.path())) continue;
+
+            std::string outName = format.empty()
+                                   ? entry.path().filename().string()
+                                   : (entry.path().stem().string() + "." + to_lower(format));
+            std::string outPath = (fs::path(outDir) / outName).string();
+
+            fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
+#if RESTORE_WHOLE_IMAGE
+            if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath)) {
+#else
+            if (restore_one_image(gfpgan, entry.path().string(), outPath)) {
+#endif
+                processed++;
+            }
+        }
+
+        if (processed == 0) {
+            fprintf(stderr, "No jpg/png/webp images found in '%s'\n", imagepath.c_str());
+            return -1;
+        }
+        fprintf(stderr, "Done. %d image(s) saved to %s\n", processed, outDir.c_str());
+    } else {
+        // Single file mode.
+        std::string outPath;
+        if (!outputpath.empty()) {
+            outPath = format.empty() ? outputpath : apply_format(outputpath, format);
+        } else {
+            outPath = default_single_output(imagepath, format);
+        }
+
+#if RESTORE_WHOLE_IMAGE
+        if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath)) {
+#else
+        if (!restore_one_image(gfpgan, imagepath, outPath)) {
+#endif
+            return -1;
+        }
+        fprintf(stderr, "Saved %s\n", outPath.c_str());
+    }
 
     return 0;
 }
