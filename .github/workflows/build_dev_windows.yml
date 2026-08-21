@@ -38,8 +38,7 @@ jobs:
       if: steps.cache-vulkansdk.outputs.cache-hit != 'true'
       run: |
         Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/${{ vars.VULKAN_SDK_VERSION }}/windows/vulkan_sdk.exe?Human=true -OutFile VulkanSDK-${{ vars.VULKAN_SDK_VERSION }}-Installer.exe
-        .\VulkanSDK-Installer.exe --root VulkanSDK --accept-licenses --default-answer --confirm-command install
-        
+        .\VulkanSDK-${{ vars.VULKAN_SDK_VERSION }}-Installer.exe --root VulkanSDK --accept-licenses --default-answer --confirm-command install
     - name: install opencv
       if: steps.cache-opencv.outputs.cache-hit != 'true'
       run: |
