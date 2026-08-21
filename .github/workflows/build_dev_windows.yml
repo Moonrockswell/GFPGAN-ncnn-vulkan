@@ -49,5 +49,5 @@ jobs:
         $env:OpenCV_DIR="$(pwd)/OpenCV/opencv/build"
         $env:VULKAN_SDK="$(pwd)/VulkanSDK"
         mkdir build; cd build
-        cmake -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ../src
+        cmake -A x64 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" ../src
         cmake --build . --config Release -j 2
