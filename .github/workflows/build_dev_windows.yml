@@ -51,6 +51,9 @@ jobs:
         mkdir build; cd build
         cmake -A x64 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" ../src
         cmake --build . --config Release -j 2
+    - name: find exe
+      run: |
+        Get-ChildItem -Path build -Recurse -Filter *.exe        
     - name: upload artifact
       uses: actions/upload-artifact@v4
       with:
