@@ -56,6 +56,48 @@ cmake ..
 cmake --build . --parallel $(($(nproc) - 1))
 ```
 
+## Usage 🖥️
+
+```console
+Usage: GFPGAN-ncnn-vulkan -i infile -o outfile [options]...
+  -h                   show this help
+  -i input-path        input image path (jpg/png/webp) or directory
+  -o output-path       output image path (jpg/png/webp) or directory
+  -m model-path        folder path to the pre-trained models (default=./gfpgan-models)
+  -f output format       output image format (jpg/png/webp, default=ext/png)
+*Unmodifiable Options*
+ -s scale               upscale ratio (default=2)
+ -t tile-size           tile size (default = 400)
+ -n model name     GFPGANCleanv1-NoCE-C2 supports only one type of model
+```
+
+### Default output paths (when `-o` is omitted)
+
+| Input | Output |
+| --- | --- |
+| Single file, e.g. `0001.jpg` | Same folder, named `0001-output.jpg` (extension follows `-f`, or the input's own extension, or `png` as a last resort) |
+| Folder, e.g. `./image` (mixed jpg/png/webp files) | A new subfolder `./image/image-output/` is created; every image directly inside `./image` is restored and saved there under its **original filename** (extension changed only if `-f` is given) |
+
+Folder mode is not recursive — only files directly inside the given folder are processed, and the newly created `<foldername>-output` subfolder is automatically skipped.
+
+Examples:
+
+```console
+GFPGAN-ncnn-vulkan /?
+GFPGAN-ncnn-vulkan -i 0001.jpg
+GFPGAN-ncnn-vulkan -i 0001.jpg -o restored.png
+GFPGAN-ncnn-vulkan -i 0001.jpg -f webp
+GFPGAN-ncnn-vulkan -i ./image
+GFPGAN-ncnn-vulkan -i ./image -f jpg
+GFPGAN-ncnn-vulkan -i ./image -o ./restored -m D:\models\gfpgan-models
+```
+
+`-f` forces the output image format regardless of the extension in `-o` or the input file (e.g. `-i ./image -f jpg` saves every restored image as `.jpg` inside `./image/image-output`).
+
+The model files (`encoder.param`, `encoder.bin`, `style.bin`, `yolov5-blazeface.param`, `yolov5-blazeface.bin`, `real_esrgan.param`, `real_esrgan.bin`) must be placed in a folder named **`gfpgan-models`** next to the executable, or pointed to explicitly with `-m`.
+
+The *Unmodifiable Options* section is informational only — `-s`, `-t`, and `-n` are not accepted as command-line flags. Scale (2x) and tile size (400) are fixed in the current implementation, and only the bundled GFPGANCleanv1-NoCE-C2 model is supported.
+
 ## :construction: Model support :construction:
 
 1. GFPGANCleanv1-NoCE-C2
@@ -81,6 +123,7 @@ cmake --build . --parallel $(($(nproc) - 1))
 11. <https://github.com/ultralytics/ultralytics>
 
 ## Download Model files (GFPGAN-ncnn model files)
+
 ### Models-v0.0.1
 
 <https://github.com/onuralpszr/GFPGAN-ncnn-vulkan/releases/download/v0.0.1-models/GFPGAN-ncnn-models.zip>
