@@ -26,7 +26,7 @@ static void print_usage(const char *progname) {
         "  -i input-path        input image path (jpg/png/webp) or directory\n"
         "  -o output-path       output image path (jpg/png/webp) or directory\n"
         "  -m model-path        folder path to the pre-trained models (default=%s)\n"
-        "  -f output format       output image format (jpg/png/webp, default=ext/png)\n"
+        "  -f output format       output image format (jpg/png/webp, default=png)\n"
         "  -t tile-size           background upscale tile size, must be > 0 (default = 400)\n"
         "                          smaller values reduce GPU memory/load per step,\n"
         "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
@@ -65,22 +65,11 @@ static std::string apply_format(const std::string &path, const std::string &fmt)
 
 // Default output path for a single input file when -o is not given:
 // same folder as the input, "<name>-output.<ext>" (no space before "-output").
-// Extension follows -f when given, otherwise the input file's own extension,
-// falling back to png if that extension isn't a supported image format.
+// Extension follows -f when given, otherwise always png.
 static std::string default_single_output(const std::string &inputPath, const std::string &format) {
     fs::path p(inputPath);
     std::string stem = p.stem().string();
-
-    std::string ext;
-    if (!format.empty()) {
-        ext = to_lower(format);
-    } else {
-        std::string inExt = p.extension().string();
-        if (!inExt.empty() && inExt[0] == '.') inExt = inExt.substr(1);
-        inExt = to_lower(inExt);
-        ext = is_supported_format(inExt) ? inExt : "png";
-    }
-
+    std::string ext = !format.empty() ? to_lower(format) : "png";
     fs::path outPath = p.parent_path() / (stem + "-output." + ext);
     return outPath.string();
 }
@@ -88,12 +77,14 @@ static std::string default_single_output(const std::string &inputPath, const std
 // Default output folder for a directory input when -o is not given:
 // "<foldername>-output" created as a subfolder inside the input folder,
 // e.g. ./image -> ./image/image-output
+// Special case: "." (or a bare trailing slash) has no folder name of its
+// own, so instead of producing an odd ".-output" folder we just use "output".
 static std::string default_output_folder(const std::string &inputDir) {
     fs::path p(inputDir);
     std::string dirname = p.filename().string();
-    if (dirname.empty()) {
-        // handles a trailing slash, e.g. "./image/"
-        dirname = p.parent_path().filename().string();
+    if (dirname.empty() || dirname == "." || dirname == "..") {
+        fs::path outDir = p / "output";
+        return outDir.string();
     }
     fs::path outDir = p / (dirname + "-output");
     return outDir.string();
@@ -312,9 +303,8 @@ int main(int argc, char **argv) {
         for (const auto &entry : fs::directory_iterator(imagepath)) {
             if (!is_image_file(entry.path())) continue;
 
-            std::string outName = format.empty()
-                                   ? entry.path().filename().string()
-                                   : (entry.path().stem().string() + "." + to_lower(format));
+            std::string outExt = !format.empty() ? to_lower(format) : "png";
+            std::string outName = entry.path().stem().string() + "." + outExt;
             std::string outPath = (fs::path(outDir) / outName).string();
 
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
