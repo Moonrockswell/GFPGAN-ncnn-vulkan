@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <filesystem>
 #include <net.h>
 #include "gfpgan.h"
@@ -21,23 +22,27 @@ static const char *DEFAULT_MODEL_DIR = "./gfpgan-models";
 
 static void print_usage(const char *progname) {
     fprintf(stderr,
-        "Usage: %s -i infile -o outfile [options]...\n"
-        "  -h                   show this help\n"
-        "  -i input-path        input image path (jpg/png/webp) or directory\n"
-        "  -o output-path       output image path (jpg/png/webp) or directory\n"
-        "  -m model-path        folder path to the pre-trained models (default=%s)\n"
-        "  -f output format       output image format (jpg/png/webp, default=png)\n"
-        "  -t tile-size           background upscale tile size, must be > 0 (default = 400)\n"
-        "                          smaller values reduce GPU memory/load per step,\n"
-        "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
-        "*Unmodifiable Options*\n"
-        " -s scale               upscale ratio (default=2)\n"
-        " -n model name     GFPGANCleanv1-NoCE-C2 supports only one type of model\n"
+        "Usage: %s -i infile -o outfile [options]\n"
         "\n"
-        "If -o is omitted:\n"
-        "  - single file input : saved next to the input as <name>-output.<ext>\n"
-        "  - folder input       : saved into a new '<foldername>-output' subfolder\n"
-        "                          inside the input folder, original filenames kept\n",
+        "  -h                       show this help\n"
+        "  -i input-path          input image path (jpg/png/webp) or folder\n"
+        "  -o output-path       output image path (jpg/png/webp) or folder\n"
+        "                            If -o is omitted\n"
+        "                            1) single file input - saved next to the input as <name>-output.<ext>\n"
+        "                            2) saved into a new '<foldername>-output' subfolder\n"
+        "                               inside the input folder, original files kept\n"
+        "                            3) . is recognized as the current folder\n"
+        "  \n"
+        "  -m model-path       folder path to the pre-trained models (default=%s)\n"
+        "  -f output format     output image format (jpg/png/webp, default=png)\n"
+        "  -t tile-size             background upscale tile-size, must be > 0 (default = 300) \n"
+        "                            smaller values reduce GPU memory load per step\n"
+        "                            useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
+        "\n"
+        "*Unmodifiable Options*\n"
+        "\n"
+        "  -s scale                 upscale ratio (default=2)\n"
+        "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n",
         progname, DEFAULT_MODEL_DIR);
 }
 
@@ -135,14 +140,26 @@ static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &tr
     cv::bitwise_and(inv_restored, inv_restored, pasted_face, inv_mask_erosion);
 
     int total_face_area = cv::countNonZero(inv_mask_erosion);
+    if (total_face_area <= 0) {
+        // The aligned face fell almost entirely outside the photo
+        // (e.g. a face cropped at the image edge). Nothing valid to
+        // paste back, so skip this face instead of crashing on a
+        // zero-size erosion kernel below.
+        return;
+    }
+
     int w_edge = int(std::sqrt(total_face_area) / 20);
-    int erosion_radius = w_edge * 2;
+    // cv::getStructuringElement/cv::erode require a kernel of at least 1x1;
+    // a tiny detected face area can make w_edge (and therefore the kernel
+    // size) collapse to 0, which crashes with an OpenCV assertion. Clamp
+    // to a sane minimum instead.
+    int erosion_radius = std::max(1, w_edge * 2);
     cv::Mat inv_mask_center;
 
     kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(erosion_radius, erosion_radius));
     cv::erode(inv_mask_erosion, inv_mask_center, kernel);
 
-    int blur_size = w_edge * 2;
+    int blur_size = std::max(1, w_edge * 2);
     cv::Mat inv_soft_mask;
     cv::GaussianBlur(inv_mask_center, inv_soft_mask, cv::Size(blur_size + 1, blur_size + 1), 0, 0, 4);
 
@@ -161,27 +178,86 @@ static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &tr
 
 #endif
 
+// ---------- 후처리: 디노이즈 / 샤프닝 (1배 스케일, 최종 합성본에만 적용) ----------
+// 얼굴 보정 단계와 섞으면 얼굴 디테일이 뭉개지거나 부자연스러워질 수 있어서,
+// 배경 업스케일 + 얼굴 합성이 전부 끝난 최종 이미지에 대해서만, 크기 변경 없이
+// (스케일 1배) 마지막 후처리로 적용합니다.
+
+// strength: 0(끔) ~ 100. cv::fastNlMeansDenoisingColored의 h(밝기)/hColor(색상)
+// 강도 파라미터로 매핑합니다 (대략 1~15 범위, OpenCV 권장 기본값이 h=3 부근).
+static void apply_denoise(cv::Mat &img, int strength) {
+    if (strength <= 0) return;
+    if (strength > 100) strength = 100;
+    float h = 1.0f + (strength / 100.0f) * 14.0f;
+    cv::Mat out;
+    cv::fastNlMeansDenoisingColored(img, out, h, h, 7, 21);
+    img = out;
+}
+
+// strength: 0(끔) ~ 100. 가우시안 블러 버전과의 차이를 더해주는 언샵 마스크 방식.
+// amount가 클수록 윤곽선 대비가 강해집니다 (대략 0~2.0x 범위로 매핑).
+static void apply_sharpen(cv::Mat &img, int strength) {
+    if (strength <= 0) return;
+    if (strength > 100) strength = 100;
+    double amount = (strength / 100.0) * 2.0;
+    cv::Mat blurred;
+    cv::GaussianBlur(img, blurred, cv::Size(0, 0), 3.0);
+    cv::Mat sharpened;
+    cv::addWeighted(img, 1.0 + amount, blurred, -amount, 0, sharpened);
+    img = sharpened;
+}
+
 // Runs the full restoration pipeline on a single image and writes the result.
 // Models are already loaded, so this can be called repeatedly for batch processing.
 static bool restore_one_image(GFPGAN &gfpgan,
 #if RESTORE_WHOLE_IMAGE
                                Face &face_detector, RealESRGAN &real_esrgan,
 #endif
-                               const std::string &inputPath, const std::string &outputPath) {
+                               const std::string &inputPath, const std::string &outputPath,
+                               int denoiseStrength, int sharpenStrength) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
         return false;
     }
 
+    // Wrap the whole restoration pipeline so that an unexpected OpenCV/ncnn
+    // exception on one image (e.g. an assertion failure, or a Vulkan error
+    // surfaced as an exception) doesn't take down the whole batch run.
+    // We log the failure and skip just this image; the caller's loop moves
+    // on to the next file.
+    try {
+
 #if RESTORE_WHOLE_IMAGE
     cv::Mat bg_upsample;
     real_esrgan.tile_process(img, bg_upsample);
 
+    std::vector<Object> objects;
+    // nms_threshold: 0.3 (원래 기본값) -> 0.45 로 상향.
+    // 겹치는 검출 박스를 더 적극적으로 하나로 합쳐서, 만화/일러스트처럼
+    // 실사 얼굴 검출기가 오작동하기 쉬운 이미지에서 같은 부위 주변에
+    // 중복으로 잡히는 오탐지 박스 수를 줄입니다. prob_threshold(0.7)는 그대로.
+    face_detector.detect(img, objects, 0.7f, 0.45f);
+
+    // 만화/일러스트/스캔 이미지는 실사 얼굴 학습 기반 검출기 특성상
+    // 눈/무늬 등을 얼굴로 오탐지해서 후보가 비정상적으로 많이 나올 수 있습니다.
+    // 후보 하나당 GFPGAN 512x512 GPU 추론이 한 번씩 더 들어가므로, 오탐지가
+    // 쌓이면 VRAM/처리시간이 누적되어 device lost(vkQueueSubmit failed)로
+    // 이어질 수 있습니다. 점수(score) 상위 kMaxFacesPerImage개만 남겨서
+    // 이런 오탐지 폭주가 GPU를 죽이는 것을 막습니다. 정상적인 인물 사진은
+    // 보통 이 한도 안에 들어오므로 실질적인 영향이 없습니다.
+    const size_t kMaxFacesPerImage = 5;
+    if (objects.size() > kMaxFacesPerImage) {
+        std::sort(objects.begin(), objects.end(),
+                   [](const Object &a, const Object &b) { return a.score > b.score; });
+        fprintf(stderr, "Warning: %zu face candidates detected, keeping top %zu by confidence "
+                         "(likely false positives on illustration/scan input)\n",
+                objects.size(), kMaxFacesPerImage);
+        objects.resize(kMaxFacesPerImage);
+    }
+
     std::vector<cv::Mat> trans_img;
     std::vector<cv::Mat> trans_matrix_inv;
-    std::vector<Object> objects;
-    face_detector.detect(img, objects);
     face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img);
 
     for (size_t i = 0; i < objects.size(); i++) {
@@ -193,6 +269,11 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
         paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample);
     }
+
+    // 얼굴 보정 + 합성이 전부 끝난 뒤, 크기 변경 없이(1배) 후처리 적용
+    apply_denoise(bg_upsample, denoiseStrength);
+    apply_sharpen(bg_upsample, sharpenStrength);
+
     cv::imwrite(outputPath, bg_upsample);
 #else
     ncnn::Mat gfpgan_result;
@@ -200,8 +281,20 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
     cv::Mat restored_face;
     to_ocv(gfpgan_result, restored_face);
+
+    apply_denoise(restored_face, denoiseStrength);
+    apply_sharpen(restored_face, sharpenStrength);
+
     cv::imwrite(outputPath, restored_face);
 #endif
+
+    } catch (const cv::Exception &e) {
+        fprintf(stderr, "OpenCV error while processing '%s': %s\n", inputPath.c_str(), e.what());
+        return false;
+    } catch (const std::exception &e) {
+        fprintf(stderr, "Error while processing '%s': %s\n", inputPath.c_str(), e.what());
+        return false;
+    }
 
     return true;
 }
@@ -212,6 +305,8 @@ int main(int argc, char **argv) {
     std::string modeldir = DEFAULT_MODEL_DIR;
     std::string format;
     int tilesize = 400;  // background upscale tile size, overridable via -t
+    int denoiseStrength = 0;  // -dn, 0-100, default off
+    int sharpenStrength = 0;  // -sp, 0-100, default off
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -238,6 +333,10 @@ int main(int argc, char **argv) {
             format = argv[++i];
         } else if (arg == "-t" && i + 1 < argc) {
             tilesize = std::atoi(argv[++i]);
+        } else if (arg == "-dn" && i + 1 < argc) {
+            denoiseStrength = std::atoi(argv[++i]);
+        } else if (arg == "-sp" && i + 1 < argc) {
+            sharpenStrength = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -259,6 +358,18 @@ int main(int argc, char **argv) {
 
     if (tilesize <= 0) {
         fprintf(stderr, "Error: -t tile-size must be a positive integer (got '%d')\n\n", tilesize);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (denoiseStrength < 0 || denoiseStrength > 100) {
+        fprintf(stderr, "Error: -dn denoise-strength must be between 0 and 100 (got '%d')\n\n", denoiseStrength);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (sharpenStrength < 0 || sharpenStrength > 100) {
+        fprintf(stderr, "Error: -sp sharpen-strength must be between 0 and 100 (got '%d')\n\n", sharpenStrength);
         print_usage(argv[0]);
         return -1;
     }
@@ -309,9 +420,11 @@ int main(int argc, char **argv) {
 
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
-            if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath)) {
+            if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
+                                   denoiseStrength, sharpenStrength)) {
 #else
-            if (restore_one_image(gfpgan, entry.path().string(), outPath)) {
+            if (restore_one_image(gfpgan, entry.path().string(), outPath,
+                                   denoiseStrength, sharpenStrength)) {
 #endif
                 processed++;
             }
@@ -332,9 +445,11 @@ int main(int argc, char **argv) {
         }
 
 #if RESTORE_WHOLE_IMAGE
-        if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath)) {
+        if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
+                                denoiseStrength, sharpenStrength)) {
 #else
-        if (!restore_one_image(gfpgan, imagepath, outPath)) {
+        if (!restore_one_image(gfpgan, imagepath, outPath,
+                                denoiseStrength, sharpenStrength)) {
 #endif
             return -1;
         }
