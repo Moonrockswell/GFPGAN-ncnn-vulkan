@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cctype>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -26,9 +27,11 @@ static void print_usage(const char *progname) {
         "  -o output-path       output image path (jpg/png/webp) or directory\n"
         "  -m model-path        folder path to the pre-trained models (default=%s)\n"
         "  -f output format       output image format (jpg/png/webp, default=ext/png)\n"
+        "  -t tile-size           background upscale tile size, must be > 0 (default = 400)\n"
+        "                          smaller values reduce GPU memory/load per step,\n"
+        "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
         "*Unmodifiable Options*\n"
         " -s scale               upscale ratio (default=2)\n"
-        " -t tile-size           tile size (default = 400)\n"
         " -n model name     GFPGANCleanv1-NoCE-C2 supports only one type of model\n"
         "\n"
         "If -o is omitted:\n"
@@ -217,6 +220,7 @@ int main(int argc, char **argv) {
     std::string outputpath;
     std::string modeldir = DEFAULT_MODEL_DIR;
     std::string format;
+    int tilesize = 400;  // background upscale tile size, overridable via -t
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -241,6 +245,8 @@ int main(int argc, char **argv) {
             modeldir = argv[++i];
         } else if (arg == "-f" && i + 1 < argc) {
             format = argv[++i];
+        } else if (arg == "-t" && i + 1 < argc) {
+            tilesize = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -256,6 +262,12 @@ int main(int argc, char **argv) {
 
     if (!format.empty() && !is_supported_format(format)) {
         fprintf(stderr, "Error: unsupported -f format '%s' (use jpg/png/webp)\n\n", format.c_str());
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (tilesize <= 0) {
+        fprintf(stderr, "Error: -t tile-size must be a positive integer (got '%d')\n\n", tilesize);
         print_usage(argv[0]);
         return -1;
     }
@@ -279,6 +291,7 @@ int main(int argc, char **argv) {
 
     RealESRGAN real_esrgan;
     real_esrgan.load(modeldir + "/real_esrgan.param", modeldir + "/real_esrgan.bin");
+    real_esrgan.tile_size = tilesize;   // -t 로 넘긴 값 적용 (기본 400)
 #endif
 
     bool inputIsDir = fs::is_directory(imagepath);
