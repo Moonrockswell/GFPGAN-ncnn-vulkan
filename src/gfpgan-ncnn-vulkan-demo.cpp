@@ -39,6 +39,9 @@ static void print_usage(const char *progname) {
         "                            smaller values reduce GPU memory load per step\n"
         "                            useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
         "  -s scale                 1=off (keep original resolution), 2=on (default, 2x upscale)\n"
+        "  -mf max-faces          max face candidates processed per image, 1-20 (default = 5)\n"
+        "                            raise this if legitimate photos have more than 5 faces;\n"
+        "                            excess candidates beyond this cap are dropped by confidence score\n"
         "\n"
         "*Unmodifiable Options*\n"
         "\n"
@@ -242,7 +245,8 @@ static bool restore_one_image(GFPGAN &gfpgan,
                                Face &face_detector, RealESRGAN &real_esrgan,
 #endif
                                const std::string &inputPath, const std::string &outputPath,
-                               int denoiseStrength, int sharpenStrength, int claheStrength, int scale) {
+                               int denoiseStrength, int sharpenStrength, int claheStrength, int scale,
+                               size_t maxFacesPerImage) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
@@ -274,14 +278,15 @@ static bool restore_one_image(GFPGAN &gfpgan,
     // 이어질 수 있습니다. 점수(score) 상위 kMaxFacesPerImage개만 남겨서
     // 이런 오탐지 폭주가 GPU를 죽이는 것을 막습니다. 정상적인 인물 사진은
     // 보통 이 한도 안에 들어오므로 실질적인 영향이 없습니다.
-    const size_t kMaxFacesPerImage = 5;
-    if (objects.size() > kMaxFacesPerImage) {
+    // 상한값은 -mf 옵션으로 조절 가능 (기본 5, 단체 사진처럼 얼굴이 실제로
+    // 많은 경우 -mf 10 등으로 올려서 정상 얼굴이 잘리는 것을 방지).
+    if (objects.size() > maxFacesPerImage) {
         std::sort(objects.begin(), objects.end(),
                    [](const Object &a, const Object &b) { return a.score > b.score; });
         fprintf(stderr, "Warning: %zu face candidates detected, keeping top %zu by confidence "
                          "(likely false positives on illustration/scan input)\n",
-                objects.size(), kMaxFacesPerImage);
-        objects.resize(kMaxFacesPerImage);
+                objects.size(), maxFacesPerImage);
+        objects.resize(maxFacesPerImage);
     }
 
     std::vector<cv::Mat> trans_img;
@@ -350,6 +355,7 @@ int main(int argc, char **argv) {
     int sharpenStrength = 0;  // -sp, 0-100, default off
     int claheStrength = 0;  // -cl, 0-100, default off (CLAHE 자동 대비 향상)
     int scale = 2;  // -s, 1=off(원본 해상도), 2=on(기본, 2배 업스케일)
+    int maxFaces = 5;  // -mf, 이미지 한 장당 처리할 최대 얼굴 후보 수 (기본 5)
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -384,6 +390,8 @@ int main(int argc, char **argv) {
             claheStrength = std::atoi(argv[++i]);
         } else if (arg == "-s" && i + 1 < argc) {
             scale = std::atoi(argv[++i]);
+        } else if (arg == "-mf" && i + 1 < argc) {
+            maxFaces = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -429,6 +437,12 @@ int main(int argc, char **argv) {
 
     if (scale != 1 && scale != 2) {
         fprintf(stderr, "Error: -s scale must be 1 (off) or 2 (on, default) (got '%d')\n\n", scale);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (maxFaces < 1 || maxFaces > 20) {
+        fprintf(stderr, "Error: -mf max-faces must be between 1 and 20 (got '%d')\n\n", maxFaces);
         print_usage(argv[0]);
         return -1;
     }
@@ -480,10 +494,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
             if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
 #else
             if (restore_one_image(gfpgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
 #endif
                 processed++;
             }
@@ -505,10 +519,10 @@ int main(int argc, char **argv) {
 
 #if RESTORE_WHOLE_IMAGE
         if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
 #else
         if (!restore_one_image(gfpgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
 #endif
             return -1;
         }
