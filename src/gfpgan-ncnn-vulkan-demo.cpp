@@ -159,7 +159,13 @@ static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &tr
     kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(erosion_radius, erosion_radius));
     cv::erode(inv_mask_erosion, inv_mask_center, kernel);
 
-    int blur_size = std::max(1, w_edge * 2);
+    // cv::GaussianBlur requires an odd kernel size. blur_size is used below as
+    // (blur_size + 1), so blur_size itself must be even for the final kernel
+    // to be odd. w_edge * 2 is always even, EXCEPT when w_edge is 0, in which
+    // case std::max(1, 0) previously collapsed this to 1 (odd) -> kernel size
+    // 2 (even) -> "Assertion failed: ksize.width % 2 == 1" crash. Clamp to a
+    // minimum of 2 instead of 1 so the kernel size stays odd in all cases.
+    int blur_size = std::max(2, w_edge * 2);
     cv::Mat inv_soft_mask;
     cv::GaussianBlur(inv_mask_center, inv_soft_mask, cv::Size(blur_size + 1, blur_size + 1), 0, 0, 4);
 
