@@ -200,6 +200,28 @@ static void apply_denoise(cv::Mat &img, int strength) {
     img = out;
 }
 
+// strength: 0(끔) ~ 100. CLAHE(Contrast Limited Adaptive Histogram Equalization)로
+// 저노출/뿌연 사진의 대비를 지역적으로 끌어올립니다. RGB 채널에 직접 걸면
+// 색이 틀어지므로, Lab 색공간의 밝기(L) 채널에만 적용하고 색상(a/b) 채널은
+// 그대로 둡니다. clipLimit이 클수록 대비 향상이 강해지지만 노이즈도 같이
+// 증폭될 수 있어 1.0~4.0 범위로 제한합니다. 타일 크기는 8x8 고정(표준값).
+static void apply_clahe(cv::Mat &img, int strength) {
+    if (strength <= 0) return;
+    if (strength > 100) strength = 100;
+    double clipLimit = 1.0 + (strength / 100.0) * 3.0;
+
+    cv::Mat lab;
+    cv::cvtColor(img, lab, cv::COLOR_BGR2Lab);
+    std::vector<cv::Mat> channels;
+    cv::split(lab, channels);
+
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(clipLimit, cv::Size(8, 8));
+    clahe->apply(channels[0], channels[0]);
+
+    cv::merge(channels, lab);
+    cv::cvtColor(lab, img, cv::COLOR_Lab2BGR);
+}
+
 // strength: 0(끔) ~ 100. 가우시안 블러 버전과의 차이를 더해주는 언샵 마스크 방식.
 // amount가 클수록 윤곽선 대비가 강해집니다 (대략 0~2.0x 범위로 매핑).
 static void apply_sharpen(cv::Mat &img, int strength) {
@@ -220,7 +242,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
                                Face &face_detector, RealESRGAN &real_esrgan,
 #endif
                                const std::string &inputPath, const std::string &outputPath,
-                               int denoiseStrength, int sharpenStrength, int scale) {
+                               int denoiseStrength, int sharpenStrength, int claheStrength, int scale) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
@@ -287,7 +309,9 @@ static bool restore_one_image(GFPGAN &gfpgan,
     }
 
     // 얼굴 보정 + 합성이 전부 끝난 뒤, 크기 변경 없이(1배) 후처리 적용
+    // 순서: 디노이즈(잡티 제거) -> CLAHE(대비 향상) -> 샤프닝(선명도)
     apply_denoise(bg_upsample, denoiseStrength);
+    apply_clahe(bg_upsample, claheStrength);
     apply_sharpen(bg_upsample, sharpenStrength);
 
     cv::imwrite(outputPath, bg_upsample);
@@ -299,6 +323,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
     to_ocv(gfpgan_result, restored_face);
 
     apply_denoise(restored_face, denoiseStrength);
+    apply_clahe(restored_face, claheStrength);
     apply_sharpen(restored_face, sharpenStrength);
 
     cv::imwrite(outputPath, restored_face);
@@ -323,6 +348,7 @@ int main(int argc, char **argv) {
     int tilesize = 400;  // background upscale tile size, overridable via -t
     int denoiseStrength = 0;  // -dn, 0-100, default off
     int sharpenStrength = 0;  // -sp, 0-100, default off
+    int claheStrength = 0;  // -cl, 0-100, default off (CLAHE 자동 대비 향상)
     int scale = 2;  // -s, 1=off(원본 해상도), 2=on(기본, 2배 업스케일)
 
     if (argc < 2) {
@@ -354,6 +380,8 @@ int main(int argc, char **argv) {
             denoiseStrength = std::atoi(argv[++i]);
         } else if (arg == "-sp" && i + 1 < argc) {
             sharpenStrength = std::atoi(argv[++i]);
+        } else if (arg == "-cl" && i + 1 < argc) {
+            claheStrength = std::atoi(argv[++i]);
         } else if (arg == "-s" && i + 1 < argc) {
             scale = std::atoi(argv[++i]);
         } else {
@@ -389,6 +417,12 @@ int main(int argc, char **argv) {
 
     if (sharpenStrength < 0 || sharpenStrength > 100) {
         fprintf(stderr, "Error: -sp sharpen-strength must be between 0 and 100 (got '%d')\n\n", sharpenStrength);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (claheStrength < 0 || claheStrength > 100) {
+        fprintf(stderr, "Error: -cl clahe-strength must be between 0 and 100 (got '%d')\n\n", claheStrength);
         print_usage(argv[0]);
         return -1;
     }
@@ -446,10 +480,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
             if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, scale)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale)) {
 #else
             if (restore_one_image(gfpgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, scale)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale)) {
 #endif
                 processed++;
             }
@@ -471,10 +505,10 @@ int main(int argc, char **argv) {
 
 #if RESTORE_WHOLE_IMAGE
         if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, scale)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale)) {
 #else
         if (!restore_one_image(gfpgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, scale)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale)) {
 #endif
             return -1;
         }
