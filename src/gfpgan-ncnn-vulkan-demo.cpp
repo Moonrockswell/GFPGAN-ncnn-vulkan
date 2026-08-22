@@ -38,10 +38,10 @@ static void print_usage(const char *progname) {
         "  -t tile-size             background upscale tile-size, must be > 0 (default = 300) \n"
         "                            smaller values reduce GPU memory load per step\n"
         "                            useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
+        "  -s scale                 1=off (keep original resolution), 2=on (default, 2x upscale)\n"
         "\n"
         "*Unmodifiable Options*\n"
         "\n"
-        "  -s scale                 upscale ratio (default=2)\n"
         "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n",
         progname, DEFAULT_MODEL_DIR);
 }
@@ -220,7 +220,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
                                Face &face_detector, RealESRGAN &real_esrgan,
 #endif
                                const std::string &inputPath, const std::string &outputPath,
-                               int denoiseStrength, int sharpenStrength) {
+                               int denoiseStrength, int sharpenStrength, int scale) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
@@ -276,6 +276,16 @@ static bool restore_one_image(GFPGAN &gfpgan,
         paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample);
     }
 
+    // -s 1(off): RealESRGAN 배경 업스케일 + GFPGAN 얼굴 보정은 항상 내부적으로
+    // 2배 해상도로 수행됩니다 (모델 자체가 2배 고정이라 이 과정 자체는 끌 수
+    // 없음). 다만 "스케일 오프"를 원하면, 화질 향상 효과는 그대로 누리면서
+    // 최종 결과물 크기만 원본과 같게 돌려주기 위해 합성이 끝난 직후 원본
+    // 해상도로 다시 축소합니다. 후처리(디노이즈/샤프닝)는 이 축소가 끝난
+    // "최종 배포 크기" 기준으로 적용되도록 그 다음에 수행합니다.
+    if (scale == 1) {
+        cv::resize(bg_upsample, bg_upsample, img.size(), 0, 0, cv::INTER_AREA);
+    }
+
     // 얼굴 보정 + 합성이 전부 끝난 뒤, 크기 변경 없이(1배) 후처리 적용
     apply_denoise(bg_upsample, denoiseStrength);
     apply_sharpen(bg_upsample, sharpenStrength);
@@ -313,6 +323,7 @@ int main(int argc, char **argv) {
     int tilesize = 400;  // background upscale tile size, overridable via -t
     int denoiseStrength = 0;  // -dn, 0-100, default off
     int sharpenStrength = 0;  // -sp, 0-100, default off
+    int scale = 2;  // -s, 1=off(원본 해상도), 2=on(기본, 2배 업스케일)
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -343,6 +354,8 @@ int main(int argc, char **argv) {
             denoiseStrength = std::atoi(argv[++i]);
         } else if (arg == "-sp" && i + 1 < argc) {
             sharpenStrength = std::atoi(argv[++i]);
+        } else if (arg == "-s" && i + 1 < argc) {
+            scale = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -376,6 +389,12 @@ int main(int argc, char **argv) {
 
     if (sharpenStrength < 0 || sharpenStrength > 100) {
         fprintf(stderr, "Error: -sp sharpen-strength must be between 0 and 100 (got '%d')\n\n", sharpenStrength);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (scale != 1 && scale != 2) {
+        fprintf(stderr, "Error: -s scale must be 1 (off) or 2 (on, default) (got '%d')\n\n", scale);
         print_usage(argv[0]);
         return -1;
     }
@@ -427,10 +446,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
             if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength)) {
+                                   denoiseStrength, sharpenStrength, scale)) {
 #else
             if (restore_one_image(gfpgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength)) {
+                                   denoiseStrength, sharpenStrength, scale)) {
 #endif
                 processed++;
             }
@@ -452,10 +471,10 @@ int main(int argc, char **argv) {
 
 #if RESTORE_WHOLE_IMAGE
         if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength)) {
+                                denoiseStrength, sharpenStrength, scale)) {
 #else
         if (!restore_one_image(gfpgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength)) {
+                                denoiseStrength, sharpenStrength, scale)) {
 #endif
             return -1;
         }
