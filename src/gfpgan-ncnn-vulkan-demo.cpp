@@ -61,13 +61,16 @@ static void print_usage(const char *progname) {
         "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n"
         "                            (fixed, cannot be changed)\n"
         "  -rn model-name    RealESRGAN model to use, file names kept exactly as officially\n"
-        "                            distributed - default=realesrgan-x4plus\n"
-        "                            realesrgan-x4plus          general photos (default)\n"
+        "                            distributed - default=realesrgan-x2plus\n"
+        "                            realesrgan-x2plus          general photos, native 2x (default) -\n"
+        "                                                             about half the GPU work of x4plus,\n"
+        "                                                             a safe default on slower/older GPUs\n"
+        "                            realesrgan-x4plus          general photos, native 4x - sharper/\n"
+        "                                                             more detail than x2plus, but roughly\n"
+        "                                                             double the GPU work; try this if\n"
+        "                                                             x2plus isn't detailed enough and your\n"
+        "                                                             GPU can handle the extra load\n"
         "                            realesrgan-x4plus-anime  anime / illustration art\n"
-        "                            realesrgan-x2plus          general photos, native 2x -\n"
-        "                                                             about half the GPU work of\n"
-        "                                                             x4plus, good middle ground on\n"
-        "                                                             slower GPUs\n"
         "                            realesr-animevideov3      video frames (lightweight)\n"
         "  -f output format     output image format (jpg/png/webp, default=png)\n"
         "  -t tile-size             background upscale tile-size, must be > 0 (default = 300) \n"
@@ -620,7 +623,7 @@ int main(int argc, char **argv) {
     std::string outputpath;
     std::string modeldir = DEFAULT_MODEL_DIR;
     std::string realesrganModelDir = DEFAULT_REALESRGAN_MODEL_DIR;  // -rm
-    std::string realesrganModelName = "realesrgan-x4plus";  // -rn, 이미지 종류에 맞게 선택
+    std::string realesrganModelName = "realesrgan-x2plus";  // -rn, 이미지 종류에 맞게 선택 (기본값: 저사양 GPU에서도 무난한 x2plus)
     std::string format;
     int tilesize = 400;  // background upscale tile size, overridable via -t
     int denoiseStrength = 0;  // -dn, 0-100, default off
