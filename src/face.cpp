@@ -182,7 +182,7 @@ int Face::load(const std::string &param_path, const std::string &model_path) {
 }
 
 int Face::align_warp_face(cv::Mat &img, const std::vector<Object> &objects, std::vector<cv::Mat> &trans_matrix_inv,
-                          std::vector<cv::Mat> &trans_img) {
+                          std::vector<cv::Mat> &trans_img, int bg_upscale) {
     std::vector<cv::Point2f> face_template;
     face_template.push_back(cv::Point2f(192, 240));
     face_template.push_back(cv::Point2f(319, 240));
@@ -196,7 +196,7 @@ int Face::align_warp_face(cv::Mat &img, const std::vector<Object> &objects, std:
 
         cv::Mat affine_matrix_inv;
         cv::invertAffineTransform(affine_matrix, affine_matrix_inv);
-        trans_matrix_inv.push_back(affine_matrix_inv * 2);
+        trans_matrix_inv.push_back(affine_matrix_inv * bg_upscale);
         trans_img.push_back(cropped_face);
 
     }

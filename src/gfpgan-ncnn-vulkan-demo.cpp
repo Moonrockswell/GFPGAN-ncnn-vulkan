@@ -39,6 +39,9 @@ namespace fs = std::filesystem;
 // Default folder (relative to the executable / current working directory)
 // where the .param / .bin model files are expected to be found.
 static const char *DEFAULT_MODEL_DIR = "./gfpgan-models";
+// RealESRGAN(배경 업스케일) 모델은 GFPGAN(얼굴 보정) 모델과 별도 폴더에 둡니다.
+// 공식 realesrgan-ncnn-vulkan 배포본의 모델 파일명을 변형 없이 그대로 사용합니다.
+static const char *DEFAULT_REALESRGAN_MODEL_DIR = "./realesrgan-models";
 
 static void print_usage(const char *progname) {
     fprintf(stderr,
@@ -53,12 +56,23 @@ static void print_usage(const char *progname) {
         "                               inside the input folder, original files kept\n"
         "                            3) . is recognized as the current folder\n"
         "  \n"
-        "  -m model-path       folder path to the pre-trained models (default=%s)\n"
+        "  -m model-path       folder path to the GFPGAN (face) models (default=%s)\n"
+        "  -rm model-path     folder path to the RealESRGAN (background) models (default=%s)\n"
+        "  -rn model-name    RealESRGAN model to use, file names kept exactly as officially\n"
+        "                            distributed - default=realesrgan-x4plus\n"
+        "                            realesrgan-x4plus          general photos (default)\n"
+        "                            realesrgan-x4plus-anime  anime / illustration art\n"
+        "                            realesr-animevideov3      video frames (lightweight)\n"
         "  -f output format     output image format (jpg/png/webp, default=png)\n"
         "  -t tile-size             background upscale tile-size, must be > 0 (default = 300) \n"
         "                            smaller values reduce GPU memory load per step\n"
         "                            useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
-        "  -s scale                 1=off (keep original resolution), 2=on (default, 2x upscale)\n"
+        "  -s scale                 final output scale relative to original: 1/2/3/4 (default = 2)\n"
+        "                            realesrgan-x4plus / -anime always run internally at their\n"
+        "                            native 4x scale, then resize to whichever of 1/2/3/4 you pick;\n"
+        "                            realesr-animevideov3 loads a separate model per scale (2/3/4)\n"
+        "                            and outputs it directly, no resize needed (1 falls back to a\n"
+        "                            post-resize since there is no native 1x model)\n"
         "  -mf max-faces          max face candidates processed per image, 1-20 (default = 5)\n"
         "                            raise this if legitimate photos have more than 5 faces;\n"
         "                            excess candidates beyond this cap are dropped by confidence score\n"
@@ -82,7 +96,7 @@ static void print_usage(const char *progname) {
         "*Unmodifiable Options*\n"
         "\n"
         "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n",
-        progname, DEFAULT_MODEL_DIR);
+        progname, DEFAULT_MODEL_DIR, DEFAULT_REALESRGAN_MODEL_DIR);
 }
 
 static std::string to_lower(std::string s) {
@@ -490,7 +504,11 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
     std::vector<cv::Mat> trans_img;
     std::vector<cv::Mat> trans_matrix_inv;
-    face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img);
+    // real_esrgan.scale: realesrgan-x4plus 모델의 네이티브 배율(4).
+    // bg_upsample이 실제로 이 배율로 만들어지므로, 얼굴을 붙여넣을 좌표
+    // 변환도 반드시 같은 배율을 써야 얼굴이 배경 위 정확한 위치에
+    // 합성됩니다.
+    face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img, real_esrgan.scale);
 
     // 얼굴이 실제로 합성되는 영역을 누적할 마스크. 스크래치 제거(-sr)가
     // 이 영역은 절대 건드리지 않고 배경에만 적용되도록 하는 데 씁니다.
@@ -506,15 +524,20 @@ static bool restore_one_image(GFPGAN &gfpgan,
         paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample, faceRegionMask);
     }
 
-    // -s 1(off): RealESRGAN 배경 업스케일 + GFPGAN 얼굴 보정은 항상 내부적으로
-    // 2배 해상도로 수행됩니다 (모델 자체가 2배 고정이라 이 과정 자체는 끌 수
-    // 없음). 다만 "스케일 오프"를 원하면, 화질 향상 효과는 그대로 누리면서
-    // 최종 결과물 크기만 원본과 같게 돌려주기 위해 합성이 끝난 직후 원본
-    // 해상도로 다시 축소합니다. 후처리(디노이즈/샤프닝)는 이 축소가 끝난
+    // RealESRGAN 배경 업스케일 + GFPGAN 얼굴 보정은 항상 내부적으로 모델
+    // 네이티브 배율(realesrgan-x4plus 기준 4배)로 수행됩니다 (모델 구조 자체가
+    // 4배 고정이라 이 내부 처리 자체는 끌 수 없음). -s 옵션으로 고른 최종
+    // 배율(1/2/3/4)이 이 네이티브 배율과 다르면, 화질 향상 효과는 그대로
+    // 누리면서 최종 결과물 크기만 원하는 배율로 맞추기 위해 합성이 끝난
+    // 직후 리사이즈합니다. 후처리(디노이즈/샤프닝)는 이 리사이즈가 끝난
     // "최종 배포 크기" 기준으로 적용되도록 그 다음에 수행합니다.
-    if (scale == 1) {
-        cv::resize(bg_upsample, bg_upsample, img.size(), 0, 0, cv::INTER_AREA);
-        cv::resize(faceRegionMask, faceRegionMask, img.size(), 0, 0, cv::INTER_NEAREST);
+    if (scale != real_esrgan.scale) {
+        cv::Size targetSize(img.cols * scale, img.rows * scale);
+        // 축소(다운샘플)는 INTER_AREA가, 확대(업샘플)는 INTER_LANCZOS4가
+        // 더 선명하고 계단현상이 적어서 방향에 따라 보간 방식을 다르게 씁니다.
+        int interp = (scale < real_esrgan.scale) ? cv::INTER_AREA : cv::INTER_LANCZOS4;
+        cv::resize(bg_upsample, bg_upsample, targetSize, 0, 0, interp);
+        cv::resize(faceRegionMask, faceRegionMask, targetSize, 0, 0, cv::INTER_NEAREST);
     }
 
     // 얼굴 영역 경계 바로 바깥까지 안전하게 "얼굴"로 취급하도록 마스크를
@@ -575,12 +598,14 @@ int main(int argc, char **argv) {
     std::string imagepath;
     std::string outputpath;
     std::string modeldir = DEFAULT_MODEL_DIR;
+    std::string realesrganModelDir = DEFAULT_REALESRGAN_MODEL_DIR;  // -rm
+    std::string realesrganModelName = "realesrgan-x4plus";  // -rn, 이미지 종류에 맞게 선택
     std::string format;
     int tilesize = 400;  // background upscale tile size, overridable via -t
     int denoiseStrength = 0;  // -dn, 0-100, default off
     int sharpenStrength = 0;  // -sp, 0-100, default off
     int claheStrength = 0;  // -cl, 0-100, default off (CLAHE 자동 대비 향상)
-    int scale = 2;  // -s, 1=off(원본 해상도), 2=on(기본, 2배 업스케일)
+    int scale = 2;  // -s, 최종 출력 배율(원본 대비): 1/2/3/4, 기본값 2
     int maxFaces = 5;  // -mf, 이미지 한 장당 처리할 최대 얼굴 후보 수 (기본 5)
     int whiteBalance = 0;  // -wb, 0=off(기본)/1=on, 자동 화이트밸런스(Gray-World)
     int detailEnhanceStrength = 0;  // -de, 0-100, default off, edge-preserving 디테일 향상
@@ -608,6 +633,10 @@ int main(int argc, char **argv) {
             outputpath = argv[++i];
         } else if (arg == "-m" && i + 1 < argc) {
             modeldir = argv[++i];
+        } else if (arg == "-rm" && i + 1 < argc) {
+            realesrganModelDir = argv[++i];
+        } else if (arg == "-rn" && i + 1 < argc) {
+            realesrganModelName = argv[++i];
         } else if (arg == "-f" && i + 1 < argc) {
             format = argv[++i];
         } else if (arg == "-t" && i + 1 < argc) {
@@ -673,8 +702,18 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    if (scale != 1 && scale != 2) {
-        fprintf(stderr, "Error: -s scale must be 1 (off) or 2 (on, default) (got '%d')\n\n", scale);
+    if (scale < 1 || scale > 4) {
+        fprintf(stderr, "Error: -s scale must be 1, 2, 3 or 4 (default = 2) (got '%d')\n\n", scale);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (realesrganModelName != "realesrgan-x4plus"
+        && realesrganModelName != "realesrgan-x4plus-anime"
+        && realesrganModelName != "realesr-animevideov3") {
+        fprintf(stderr, "Error: -rn model-name must be one of realesrgan-x4plus, "
+                         "realesrgan-x4plus-anime, realesr-animevideov3 (got '%s')\n\n",
+                realesrganModelName.c_str());
         print_usage(argv[0]);
         return -1;
     }
@@ -724,6 +763,9 @@ int main(int argc, char **argv) {
     if (!modeldir.empty() && (modeldir.back() == '/' || modeldir.back() == '\\')) {
         modeldir.pop_back();
     }
+    if (!realesrganModelDir.empty() && (realesrganModelDir.back() == '/' || realesrganModelDir.back() == '\\')) {
+        realesrganModelDir.pop_back();
+    }
 
     GFPGAN gfpgan;
     gfpgan.load(modeldir + "/encoder.param", modeldir + "/encoder.bin", modeldir + "/style.bin");
@@ -733,7 +775,29 @@ int main(int argc, char **argv) {
     face_detector.load(modeldir + "/yolov5-blazeface.param", modeldir + "/yolov5-blazeface.bin");
 
     RealESRGAN real_esrgan;
-    real_esrgan.load(modeldir + "/real_esrgan.param", modeldir + "/real_esrgan.bin");
+    // 공식 realesrgan-ncnn-vulkan 배포본의 파일명을 변형 없이 그대로 사용합니다.
+    // realesrgan-x4plus / realesrgan-x4plus-anime: 네트워크 구조 자체가 4배
+    //   고정이라, 파일명에 배율이 붙지 않습니다. 최종 원하는 배율(-s)이
+    //   4가 아니면 4배로 처리한 뒤 나중에 리사이즈합니다 (restore_one_image 참고).
+    // realesr-animevideov3: 배율별로 별도 모델(-x2/-x3/-x4)이 나뉘어 있어서,
+    //   원하는 최종 배율(-s)에 맞는 파일을 바로 불러오면 되고, 후처리
+    //   리사이즈가 필요 없습니다.
+    std::string realesrganParam, realesrganModel;
+    if (realesrganModelName == "realesr-animevideov3") {
+        // animevideov3는 2/3/4배 모델만 배포되고 1배(원본 크기) 모델은 없습니다.
+        // -s 1을 고른 경우, 가장 작은 x2 모델을 불러온 뒤 restore_one_image의
+        // 리사이즈 단계(scale != real_esrgan.scale)에서 1배로 축소되도록 합니다.
+        int modelScale = (scale == 1) ? 2 : scale;
+        std::string suffix = "-x" + std::to_string(modelScale);
+        realesrganParam = realesrganModelDir + "/" + realesrganModelName + suffix + ".param";
+        realesrganModel = realesrganModelDir + "/" + realesrganModelName + suffix + ".bin";
+        real_esrgan.scale = modelScale;
+    } else {
+        realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
+        realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
+        real_esrgan.scale = 4;  // x4plus 계열은 네트워크 구조상 4배 고정
+    }
+    real_esrgan.load(realesrganParam, realesrganModel);
     real_esrgan.tile_size = tilesize;   // -t 로 넘긴 값 적용 (기본 400)
 #endif
 

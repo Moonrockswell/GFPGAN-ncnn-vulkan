@@ -3,7 +3,11 @@
 RealESRGAN::RealESRGAN() {
     net.opt.use_vulkan_compute = true;
     net.opt.num_threads = 4;
-    scale = 2;
+    // realesrgan-x4plus 모델은 네트워크 구조 자체가 4배 업스케일로 고정되어
+    // 있습니다(2배/3배로 학습된 모델이 아님). 최종 출력 배율을 2/3배로
+    // 낮추고 싶을 때는, 이 4배 네이티브 결과를 만든 뒤 호출부에서 원하는
+    // 배율로 다시 축소(resize)하는 방식으로 처리합니다.
+    scale = 4;
     tile_size = 400;
     tile_pad = 10;
 }
@@ -74,7 +78,12 @@ int RealESRGAN::tile_process(const cv::Mat &inimage, cv::Mat &outimage) {
     int tiles_x = std::ceil((float) inimage.cols / tile_size);
     int tiles_y = std::ceil((float) inimage.rows / tile_size);
 
-    cv::Mat out = cv::Mat(cv::Size(pad_inimage.cols * 2, pad_inimage.rows * 2), CV_8UC3);
+    // 이전에는 여기 리터럴 2가 하드코딩되어 있어서, scale 멤버 변수를
+    // 2가 아닌 값(예: realesrgan-x4plus의 4배)으로 바꾸면 출력 캔버스
+    // 크기와 아래 타일 배치 좌표 계산(* scale)이 서로 어긋나는 잠재
+    // 버그가 있었습니다. scale로 통일해서 실제 모델 배율과 항상 맞도록
+    // 고쳤습니다.
+    cv::Mat out = cv::Mat(cv::Size(pad_inimage.cols * scale, pad_inimage.rows * scale), CV_8UC3);
     for (int i = 0; i < tiles_y; i++) {
         for (int j = 0; j < tiles_x; j++) {
             int ofs_x = j * tile_size;
