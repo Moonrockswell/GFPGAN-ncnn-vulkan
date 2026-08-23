@@ -14,6 +14,23 @@
 #define RESTORE_WHOLE_IMAGE 1   //0-only restore face, 1-restore whole image
 #define RESTORE_IMAGE_COLOR 0   //0-no color image, 1-coloring grayscale images
 
+// 자동 화이트밸런스(-wb)는 opencv_contrib의 xphoto 모듈이 필요합니다.
+// opencv_contrib 없이 빌드된 환경(xphoto.hpp가 없는 경우)이라면 이 값을
+// 0으로 바꿔서 컴파일하세요. 그러면 -wb 옵션은 그대로 받아들이되 아무
+// 효과도 적용하지 않는 no-op으로 동작합니다 (빌드 자체는 항상 성공).
+#ifndef HAVE_XPHOTO
+#define HAVE_XPHOTO 1
+#endif
+
+#if HAVE_XPHOTO
+#include <opencv2/xphoto.hpp>
+#endif
+
+// cv::detailEnhance()는 OpenCV 기본(main) 모듈의 photo.hpp에 포함되어
+// 있어 opencv_contrib 없이도 항상 사용 가능합니다 (xphoto와 달리 별도
+// 확인/매크로가 필요 없음).
+#include <opencv2/photo.hpp>
+
 namespace fs = std::filesystem;
 
 // Default folder (relative to the executable / current working directory)
@@ -42,6 +59,14 @@ static void print_usage(const char *progname) {
         "  -mf max-faces          max face candidates processed per image, 1-20 (default = 5)\n"
         "                            raise this if legitimate photos have more than 5 faces;\n"
         "                            excess candidates beyond this cap are dropped by confidence score\n"
+        "  -wb white-balance   0=off (default), 1=on - auto white balance (Gray-World)\n"
+        "                            corrects color casts (fluorescent green/yellow tint, tungsten\n"
+        "                            orange tint, shade blue tint); applied before denoise/CLAHE/sharpen\n"
+        "                            (requires opencv_contrib's xphoto module; no-op if not built with it)\n"
+        "  -de detail-enhance  0-100, default = 0 (off) - edge-preserving detail enhancement\n"
+        "                            more natural alternative/addition to -sp: enhances fine texture\n"
+        "                            while preserving major edges, so it avoids the haloing that -sp\n"
+        "                            can produce at high strength; applied after CLAHE, before -sp\n"
         "\n"
         "*Unmodifiable Options*\n"
         "\n"
@@ -192,6 +217,37 @@ static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &tr
 // 배경 업스케일 + 얼굴 합성이 전부 끝난 최종 이미지에 대해서만, 크기 변경 없이
 // (스케일 1배) 마지막 후처리로 적용합니다.
 
+// ---------- 자동 화이트밸런스 (Gray-World 알고리즘) ----------
+// enabled: 0(끔, 기본) / 1(켬). 이미지 전체의 평균 색이 회색(무채색)에
+// 가까워야 한다는 가정 하에, R/G/B 채널의 평균 밝기 차이를 계산해서
+// 색 편향을 자동으로 상쇄합니다. 형광등의 초록/노랑끼, 백열등/텅스텐
+// 조명의 붉은끼, 그늘에서 찍힌 사진의 푸른끼 등을 보정하는 데 효과적
+// 입니다.
+// 다른 후처리(디노이즈/CLAHE/샤프닝)보다 먼저 적용해서, 색이 바로잡힌
+// 이미지를 기준으로 나머지 대비/선명도 보정이 이뤄지도록 합니다.
+// 주의: 인물 사진처럼 피부색(주로 붉은 계열) 하나가 화면 넓은 비중을
+// 차지하면 "회색 가정"이 깨져서 과보정(색이 부자연스럽게 틀어짐)될 수
+// 있습니다. 그래서 기본값은 꺼짐이며, 색이 눈에 띄게 편향된 사진에서만
+// 켜서 쓰는 것을 권장합니다.
+#if HAVE_XPHOTO
+static void apply_white_balance(cv::Mat &img, int enabled) {
+    if (enabled <= 0) return;
+    cv::Ptr<cv::xphoto::GrayworldWB> wb = cv::xphoto::createGrayworldWB();
+    // saturationThreshold: 이 값보다 채도가 높은 픽셀(피부, 원색 옷 등
+    // 이미 색이 뚜렷한 영역)은 회색 가정 계산에서 제외해 과보정을 줄입니다.
+    // 기본값(0.9)보다 살짝 올려서 인물 사진에서 조금 더 안전하게 동작하도록 함.
+    wb->setSaturationThreshold(0.95f);
+    cv::Mat out;
+    wb->balanceWhite(img, out);
+    img = out;
+}
+#else
+// opencv_contrib(xphoto)가 빌드에 포함되지 않은 환경: 옵션은 받아들이되
+// 아무 효과도 적용하지 않는 no-op. (아래에서 -wb 값이 1이어도 조용히
+// 무시되며 별도 에러는 내지 않습니다.)
+static void apply_white_balance(cv::Mat &, int) {}
+#endif
+
 // strength: 0(끔) ~ 100. cv::fastNlMeansDenoisingColored의 h(밝기)/hColor(색상)
 // 강도 파라미터로 매핑합니다 (대략 1~15 범위, OpenCV 권장 기본값이 h=3 부근).
 static void apply_denoise(cv::Mat &img, int strength) {
@@ -238,6 +294,33 @@ static void apply_sharpen(cv::Mat &img, int strength) {
     img = sharpened;
 }
 
+// strength: 0(끔) ~ 100. cv::detailEnhance()를 이용한 디테일 향상.
+// 기존 -sp(언샵 마스크) 샤프닝은 밝기 차이가 큰 윤곽선 주변을 단순
+// 대비 증폭시키는 방식이라, 강하게 걸면 윤곽선을 따라 밝고 어두운
+// "테두리"(헤일로)가 생기고 화면 전체가 부자연스럽게 딱딱해 보일 수
+// 있습니다.
+// 반면 detailEnhance는 edge-preserving 필터(도메인 변환 필터) 기반이라
+// 큰 윤곽선(예: 얼굴 윤곽, 배경 경계)은 그대로 보존하면서, 그 안쪽의
+// 미세한 텍스처(머리카락 올, 피부 결, 옷감 무늬 같은 작은 디테일)만
+// 국소적으로 또렷하게 살려줍니다. 그 결과 언샵 마스크보다 눈에 덜
+// 띄고 자연스러운 "화질이 좋아진" 느낌을 줍니다.
+// -sp와 별도 옵션이며, 둘 다 켜도 되고(디테일 향상 후 마지막에 약한
+// 샤프닝만 살짝 얹는 조합도 가능) -sp 대신 이것만 켜도 됩니다.
+static void apply_detail_enhance(cv::Mat &img, int strength) {
+    if (strength <= 0) return;
+    if (strength > 100) strength = 100;
+    // sigma_s(공간 표준편차, 필터가 참고하는 주변 반경): 클수록 더 넓은
+    // 영역까지 함께 보고 판단해서 효과가 굵고 진해짐. 10~70 범위로 매핑.
+    // sigma_r(색상/밝기 표준편차, 엣지로 인식하는 민감도): 작을수록 약한
+    // 경계도 엣지로 보존해 디테일을 더 세밀하게 살림. 0.15~0.40 범위로 매핑.
+    // (OpenCV 기본값: sigma_s=10, sigma_r=0.15, 즉 strength 0에 해당하는 값)
+    float sigma_s = 10.0f + (strength / 100.0f) * 60.0f;
+    float sigma_r = 0.15f + (strength / 100.0f) * 0.25f;
+    cv::Mat out;
+    cv::detailEnhance(img, out, sigma_s, sigma_r);
+    img = out;
+}
+
 // Runs the full restoration pipeline on a single image and writes the result.
 // Models are already loaded, so this can be called repeatedly for batch processing.
 static bool restore_one_image(GFPGAN &gfpgan,
@@ -246,7 +329,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
 #endif
                                const std::string &inputPath, const std::string &outputPath,
                                int denoiseStrength, int sharpenStrength, int claheStrength, int scale,
-                               size_t maxFacesPerImage) {
+                               size_t maxFacesPerImage, int whiteBalance, int detailEnhanceStrength) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
@@ -314,9 +397,12 @@ static bool restore_one_image(GFPGAN &gfpgan,
     }
 
     // 얼굴 보정 + 합성이 전부 끝난 뒤, 크기 변경 없이(1배) 후처리 적용
-    // 순서: 디노이즈(잡티 제거) -> CLAHE(대비 향상) -> 샤프닝(선명도)
+    // 순서: 화이트밸런스(색 편향 보정) -> 디노이즈(잡티 제거) -> CLAHE(대비 향상)
+    //       -> 디테일 향상(자연스러운 텍스처 보강) -> 샤프닝(마지막 선명도 마무리)
+    apply_white_balance(bg_upsample, whiteBalance);
     apply_denoise(bg_upsample, denoiseStrength);
     apply_clahe(bg_upsample, claheStrength);
+    apply_detail_enhance(bg_upsample, detailEnhanceStrength);
     apply_sharpen(bg_upsample, sharpenStrength);
 
     cv::imwrite(outputPath, bg_upsample);
@@ -327,8 +413,10 @@ static bool restore_one_image(GFPGAN &gfpgan,
     cv::Mat restored_face;
     to_ocv(gfpgan_result, restored_face);
 
+    apply_white_balance(restored_face, whiteBalance);
     apply_denoise(restored_face, denoiseStrength);
     apply_clahe(restored_face, claheStrength);
+    apply_detail_enhance(restored_face, detailEnhanceStrength);
     apply_sharpen(restored_face, sharpenStrength);
 
     cv::imwrite(outputPath, restored_face);
@@ -356,6 +444,8 @@ int main(int argc, char **argv) {
     int claheStrength = 0;  // -cl, 0-100, default off (CLAHE 자동 대비 향상)
     int scale = 2;  // -s, 1=off(원본 해상도), 2=on(기본, 2배 업스케일)
     int maxFaces = 5;  // -mf, 이미지 한 장당 처리할 최대 얼굴 후보 수 (기본 5)
+    int whiteBalance = 0;  // -wb, 0=off(기본)/1=on, 자동 화이트밸런스(Gray-World)
+    int detailEnhanceStrength = 0;  // -de, 0-100, default off, edge-preserving 디테일 향상
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -392,6 +482,10 @@ int main(int argc, char **argv) {
             scale = std::atoi(argv[++i]);
         } else if (arg == "-mf" && i + 1 < argc) {
             maxFaces = std::atoi(argv[++i]);
+        } else if (arg == "-wb" && i + 1 < argc) {
+            whiteBalance = std::atoi(argv[++i]);
+        } else if (arg == "-de" && i + 1 < argc) {
+            detailEnhanceStrength = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -447,6 +541,24 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    if (whiteBalance != 0 && whiteBalance != 1) {
+        fprintf(stderr, "Error: -wb white-balance must be 0 (off, default) or 1 (on) (got '%d')\n\n", whiteBalance);
+        print_usage(argv[0]);
+        return -1;
+    }
+#if !HAVE_XPHOTO
+    if (whiteBalance == 1) {
+        fprintf(stderr, "Warning: -wb 1 requested but this build has no opencv_contrib/xphoto support; "
+                         "white balance will be skipped (no-op).\n");
+    }
+#endif
+
+    if (detailEnhanceStrength < 0 || detailEnhanceStrength > 100) {
+        fprintf(stderr, "Error: -de detail-enhance must be between 0 and 100 (got '%d')\n\n", detailEnhanceStrength);
+        print_usage(argv[0]);
+        return -1;
+    }
+
     if (!fs::exists(imagepath)) {
         fprintf(stderr, "Error: input path '%s' does not exist\n", imagepath.c_str());
         return -1;
@@ -494,10 +606,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
             if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
 #else
             if (restore_one_image(gfpgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
 #endif
                 processed++;
             }
@@ -519,10 +631,10 @@ int main(int argc, char **argv) {
 
 #if RESTORE_WHOLE_IMAGE
         if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
 #else
         if (!restore_one_image(gfpgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
 #endif
             return -1;
         }
