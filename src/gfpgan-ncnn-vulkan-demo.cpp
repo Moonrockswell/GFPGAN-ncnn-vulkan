@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -69,6 +70,14 @@ static void print_usage(const char *progname) {
         "                            more natural alternative/addition to -sp: enhances fine texture\n"
         "                            while preserving major edges, so it avoids the haloing that -sp\n"
         "                            can produce at high strength; applied after CLAHE, before -sp\n"
+        "  -vg vignette-correct 0-100, default = 0 (off) - corrects dark corners/edges (vignetting)\n"
+        "                            brightens the image radially (more toward the corners, none at\n"
+        "                            the center); an approximate correction, not a lens-specific one;\n"
+        "                            applied right after -wb, before denoise\n"
+        "  -sr scratch-removal 0-100, default = 0 (off) - removes thin scratches/dust specks\n"
+        "                            typical of old print/film scans, via inpainting; background\n"
+        "                            only (face areas are always left untouched); applied right\n"
+        "                            after -vg, before denoise\n"
         "\n"
         "*Unmodifiable Options*\n"
         "\n"
@@ -151,7 +160,7 @@ static void to_ocv(const ncnn::Mat &result, cv::Mat &out) {
 
 #if RESTORE_WHOLE_IMAGE
 
-static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &trans_matrix_inv, cv::Mat &bg_upsample) {
+static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &trans_matrix_inv, cv::Mat &bg_upsample, cv::Mat &faceRegionMask) {
     trans_matrix_inv.at<float>(0, 2) += 1.0;
     trans_matrix_inv.at<float>(1, 2) += 1.0;
 
@@ -198,6 +207,11 @@ static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &tr
     int blur_size = std::max(2, w_edge * 2);
     cv::Mat inv_soft_mask;
     cv::GaussianBlur(inv_mask_center, inv_soft_mask, cv::Size(blur_size + 1, blur_size + 1), 0, 0, 4);
+
+    // 이 얼굴이 실제로 합성되는 영역을 배경-전용 마스크(faceRegionMask)에
+    // 누적해둡니다. 스크래치 제거(-sr)가 이 마스크를 이용해 얼굴 영역은
+    // 절대 건드리지 않고 배경에만 적용되도록 하기 위함입니다.
+    cv::bitwise_or(faceRegionMask, inv_mask_erosion, faceRegionMask);
 
     for (int h = 0; h < bg_upsample.rows; h++) {
         for (int w = 0; w < bg_upsample.cols; w++) {
@@ -249,6 +263,105 @@ static void apply_white_balance(cv::Mat &img, int enabled) {
 // 무시되며 별도 에러는 내지 않습니다.)
 static void apply_white_balance(cv::Mat &, int) {}
 #endif
+
+// strength: 0(끔) ~ 100. 렌즈/스캔 특성상 사진 가장자리(특히 네 모서리)가
+// 중심보다 어둡게 나오는 비네팅을 보정합니다. 이미지 중심에서의 거리에
+// 비례해 밝기를 부드럽게 끌어올리는 방사형(radial) 게인을 곱하는 근사적
+// 보정입니다. 실제 렌즈 광학 특성을 역산하는 정밀 보정은 아니지만, 중심
+// 대비 모서리가 어두운 사진 전반에 두루 통합니다.
+// 화이트밸런스와 같은 "전역 밝기/색 보정" 성격이라 그 바로 뒤, 디노이즈
+// 보다 앞서 적용합니다(먼저 밝기를 고르게 맞춘 뒤 잡티 제거 -> 대비 ->
+// 디테일 -> 샤프닝 순).
+static void apply_vignette_correction(cv::Mat &img, int strength) {
+    if (strength <= 0) return;
+    if (strength > 100) strength = 100;
+    // maxBoost: 모서리(중심에서 가장 먼 지점)에서 밝기를 최대 몇 배까지
+    // 끌어올릴지. 0.15(약하게)~0.75(강하게) 범위로 매핑. 중심은 항상
+    // 1.0(변화 없음)에서 시작합니다.
+    double maxBoost = 0.15 + (strength / 100.0) * 0.60;
+
+    int rows = img.rows, cols = img.cols;
+    if (rows <= 0 || cols <= 0) return;
+    float cx = cols / 2.0f, cy = rows / 2.0f;
+    float maxDist = std::sqrt(cx * cx + cy * cy);
+    if (maxDist <= 0.0f) return;
+
+    // 픽셀별 방사형 게인 맵을 미리 계산합니다 (0=중심 -> 1.0배, 1=모서리
+    // -> 1.0+maxBoost배). 거리의 제곱에 비례시켜서(코사인 4승 비네팅
+    // 감쇠 근사) 중심 근처는 거의 그대로 두고 모서리로 갈수록 완만한
+    // 곡선을 그리며 강하게 밝아지도록 합니다.
+    cv::Mat gain(rows, cols, CV_32FC1);
+    for (int y = 0; y < rows; y++) {
+        float *row = gain.ptr<float>(y);
+        float dy = y - cy;
+        for (int x = 0; x < cols; x++) {
+            float dx = x - cx;
+            float distNorm = std::sqrt(dx * dx + dy * dy) / maxDist;
+            row[x] = 1.0f + static_cast<float>(maxBoost) * (distNorm * distNorm);
+        }
+    }
+
+    std::vector<cv::Mat> channels;
+    cv::split(img, channels);
+    for (auto &ch : channels) {
+        cv::Mat ch32f;
+        ch.convertTo(ch32f, CV_32FC1);
+        ch32f = ch32f.mul(gain);
+        ch32f.convertTo(ch, ch.type());  // 다시 원래 타입(8-bit)으로, 0~255는 자동 클리핑(saturate_cast)
+    }
+    cv::merge(channels, img);
+}
+
+// strength: 0(끔) ~ 100. 오래된 인화지/필름 스캔에 흔한, 가늘고 긴 "선"
+// 형태의 스크래치(흠집)를 찾아서 cv::inpaint()로 주변 픽셀을 참고해
+// 자연스럽게 메꿉니다.
+// backgroundMask: 이 값이 255인 픽셀에만 적용됩니다(그 외는 원본 그대로
+// 둠). 이 함수는 "가늘고 긴 선"을 찾는 방식이라 머리카락/눈썹/잔주름
+// 같은 얼굴의 가는 선까지 스크래치로 오탐지하기 쉬우므로, 얼굴이 합성된
+// 영역은 항상 제외한 배경 전용 마스크를 넘겨받아 그 영역에만 적용합니다.
+static void apply_scratch_removal(cv::Mat &img, int strength, const cv::Mat &backgroundMask) {
+    if (strength <= 0) return;
+    if (strength > 100) strength = 100;
+
+    cv::Mat gray;
+    cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+
+    // top-hat: 배경보다 밝은 가는 선(밝은 스크래치), black-hat: 배경보다
+    // 어두운 가는 선(먼지/그을음/어두운 흠집)을 각각 검출합니다. 커널을
+    // 작은 원형(3x3)으로 잡아서 폭이 좁고 배경과 뚜렷이 대비되는 결함만
+    // 걸러내고, 넓은 면적의 자연스러운 명암(피부 톤, 배경 그라데이션)은
+    // 건드리지 않습니다.
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3));
+
+    cv::Mat topHat, blackHat;
+    cv::morphologyEx(gray, topHat, cv::MORPH_TOPHAT, kernel);
+    cv::morphologyEx(gray, blackHat, cv::MORPH_BLACKHAT, kernel);
+
+    // detectThreshold: 강도가 높을수록 더 옅은(약한) 결함까지 잡아냄
+    // (35 -> 8 범위, 값이 작을수록 민감).
+    int detectThreshold = 35 - (strength * 27 / 100);
+    if (detectThreshold < 8) detectThreshold = 8;
+
+    cv::Mat brightMask, darkMask, scratchMask;
+    cv::threshold(topHat, brightMask, detectThreshold, 255, cv::THRESH_BINARY);
+    cv::threshold(blackHat, darkMask, detectThreshold, 255, cv::THRESH_BINARY);
+    cv::bitwise_or(brightMask, darkMask, scratchMask);
+
+    // 배경 영역(얼굴이 아닌 곳)에서 검출된 결함만 남깁니다.
+    cv::bitwise_and(scratchMask, backgroundMask, scratchMask);
+
+    if (cv::countNonZero(scratchMask) == 0) return;
+
+    // 검출된 선을 1px 정도 살짝 넓혀서 경계까지 확실히 덮은 뒤 인페인팅합니다.
+    cv::dilate(scratchMask, scratchMask, cv::Mat(), cv::Point(-1, -1), 1);
+
+    // inpaintRadius: 결함 주변 몇 픽셀을 참고해서 채울지. 강도가 높을수록
+    // 조금 더 넓게 참고(3~7px)해서 더 매끄럽게 메웁니다.
+    double inpaintRadius = 3.0 + (strength / 100.0) * 4.0;
+    cv::Mat result;
+    cv::inpaint(img, scratchMask, result, inpaintRadius, cv::INPAINT_TELEA);
+    img = result;
+}
 
 // strength: 0(끔) ~ 100. cv::fastNlMeansDenoisingColored의 h(밝기)/hColor(색상)
 // 강도 파라미터로 매핑합니다 (대략 1~15 범위, OpenCV 권장 기본값이 h=3 부근).
@@ -331,7 +444,8 @@ static bool restore_one_image(GFPGAN &gfpgan,
 #endif
                                const std::string &inputPath, const std::string &outputPath,
                                int denoiseStrength, int sharpenStrength, int claheStrength, int scale,
-                               size_t maxFacesPerImage, int whiteBalance, int detailEnhanceStrength) {
+                               size_t maxFacesPerImage, int whiteBalance, int detailEnhanceStrength,
+                               int vignetteStrength, int scratchStrength) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
@@ -378,6 +492,10 @@ static bool restore_one_image(GFPGAN &gfpgan,
     std::vector<cv::Mat> trans_matrix_inv;
     face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img);
 
+    // 얼굴이 실제로 합성되는 영역을 누적할 마스크. 스크래치 제거(-sr)가
+    // 이 영역은 절대 건드리지 않고 배경에만 적용되도록 하는 데 씁니다.
+    cv::Mat faceRegionMask = cv::Mat::zeros(bg_upsample.size(), CV_8UC1);
+
     for (size_t i = 0; i < objects.size(); i++) {
         ncnn::Mat gfpgan_result;
         gfpgan.process(trans_img[i], gfpgan_result);
@@ -385,7 +503,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
         cv::Mat restored_face;
         to_ocv(gfpgan_result, restored_face);
 
-        paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample);
+        paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample, faceRegionMask);
     }
 
     // -s 1(off): RealESRGAN 배경 업스케일 + GFPGAN 얼굴 보정은 항상 내부적으로
@@ -396,12 +514,24 @@ static bool restore_one_image(GFPGAN &gfpgan,
     // "최종 배포 크기" 기준으로 적용되도록 그 다음에 수행합니다.
     if (scale == 1) {
         cv::resize(bg_upsample, bg_upsample, img.size(), 0, 0, cv::INTER_AREA);
+        cv::resize(faceRegionMask, faceRegionMask, img.size(), 0, 0, cv::INTER_NEAREST);
     }
 
+    // 얼굴 영역 경계 바로 바깥까지 안전하게 "얼굴"로 취급하도록 마스크를
+    // 살짝 넓힌(팽창) 뒤, 나머지 전체를 "배경"으로 간주해 스크래치 제거의
+    // 적용 범위를 제한합니다.
+    cv::Mat faceRegionMaskSafe;
+    cv::dilate(faceRegionMask, faceRegionMaskSafe, cv::Mat(), cv::Point(-1, -1), 3);
+    cv::Mat backgroundMask;
+    cv::bitwise_not(faceRegionMaskSafe, backgroundMask);
+
     // 얼굴 보정 + 합성이 전부 끝난 뒤, 크기 변경 없이(1배) 후처리 적용
-    // 순서: 화이트밸런스(색 편향 보정) -> 디노이즈(잡티 제거) -> CLAHE(대비 향상)
+    // 순서: 화이트밸런스(색 편향 보정) -> 비네팅 보정(가장자리 밝기 보정)
+    //       -> 스크래치 제거(배경 전용) -> 디노이즈(잡티 제거) -> CLAHE(대비 향상)
     //       -> 디테일 향상(자연스러운 텍스처 보강) -> 샤프닝(마지막 선명도 마무리)
     apply_white_balance(bg_upsample, whiteBalance);
+    apply_vignette_correction(bg_upsample, vignetteStrength);
+    apply_scratch_removal(bg_upsample, scratchStrength, backgroundMask);
     apply_denoise(bg_upsample, denoiseStrength);
     apply_clahe(bg_upsample, claheStrength);
     apply_detail_enhance(bg_upsample, detailEnhanceStrength);
@@ -415,7 +545,13 @@ static bool restore_one_image(GFPGAN &gfpgan,
     cv::Mat restored_face;
     to_ocv(gfpgan_result, restored_face);
 
+    // RESTORE_WHOLE_IMAGE=0 빌드(사용되지 않음)에서는 얼굴/배경 구분이
+    // 없으므로, 이미지 전체를 "배경"으로 간주해 스크래치 제거를 적용합니다.
+    cv::Mat fullMask = cv::Mat::ones(restored_face.size(), CV_8UC1) * 255;
+
     apply_white_balance(restored_face, whiteBalance);
+    apply_vignette_correction(restored_face, vignetteStrength);
+    apply_scratch_removal(restored_face, scratchStrength, fullMask);
     apply_denoise(restored_face, denoiseStrength);
     apply_clahe(restored_face, claheStrength);
     apply_detail_enhance(restored_face, detailEnhanceStrength);
@@ -448,6 +584,8 @@ int main(int argc, char **argv) {
     int maxFaces = 5;  // -mf, 이미지 한 장당 처리할 최대 얼굴 후보 수 (기본 5)
     int whiteBalance = 0;  // -wb, 0=off(기본)/1=on, 자동 화이트밸런스(Gray-World)
     int detailEnhanceStrength = 0;  // -de, 0-100, default off, edge-preserving 디테일 향상
+    int vignetteStrength = 0;  // -vg, 0-100, default off, 비네팅(가장자리 어두워짐) 보정
+    int scratchStrength = 0;  // -sr, 0-100, default off, 스크래치/먼지 제거(배경 전용, 인페인팅)
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -488,6 +626,10 @@ int main(int argc, char **argv) {
             whiteBalance = std::atoi(argv[++i]);
         } else if (arg == "-de" && i + 1 < argc) {
             detailEnhanceStrength = std::atoi(argv[++i]);
+        } else if (arg == "-vg" && i + 1 < argc) {
+            vignetteStrength = std::atoi(argv[++i]);
+        } else if (arg == "-sr" && i + 1 < argc) {
+            scratchStrength = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -561,6 +703,18 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    if (vignetteStrength < 0 || vignetteStrength > 100) {
+        fprintf(stderr, "Error: -vg vignette-correct must be between 0 and 100 (got '%d')\n\n", vignetteStrength);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (scratchStrength < 0 || scratchStrength > 100) {
+        fprintf(stderr, "Error: -sr scratch-removal must be between 0 and 100 (got '%d')\n\n", scratchStrength);
+        print_usage(argv[0]);
+        return -1;
+    }
+
     if (!fs::exists(imagepath)) {
         fprintf(stderr, "Error: input path '%s' does not exist\n", imagepath.c_str());
         return -1;
@@ -608,10 +762,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
             if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #else
             if (restore_one_image(gfpgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #endif
                 processed++;
             }
@@ -633,10 +787,10 @@ int main(int argc, char **argv) {
 
 #if RESTORE_WHOLE_IMAGE
         if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #else
         if (!restore_one_image(gfpgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #endif
             return -1;
         }
