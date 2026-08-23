@@ -58,10 +58,16 @@ static void print_usage(const char *progname) {
         "  \n"
         "  -m model-path       folder path to the GFPGAN (face) models (default=%s)\n"
         "  -rm model-path     folder path to the RealESRGAN (background) models (default=%s)\n"
+        "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n"
+        "                            (fixed, cannot be changed)\n"
         "  -rn model-name    RealESRGAN model to use, file names kept exactly as officially\n"
         "                            distributed - default=realesrgan-x4plus\n"
         "                            realesrgan-x4plus          general photos (default)\n"
         "                            realesrgan-x4plus-anime  anime / illustration art\n"
+        "                            realesrgan-x2plus          general photos, native 2x -\n"
+        "                                                             about half the GPU work of\n"
+        "                                                             x4plus, good middle ground on\n"
+        "                                                             slower GPUs\n"
         "                            realesr-animevideov3      video frames (lightweight)\n"
         "  -f output format     output image format (jpg/png/webp, default=png)\n"
         "  -t tile-size             background upscale tile-size, must be > 0 (default = 300) \n"
@@ -76,26 +82,41 @@ static void print_usage(const char *progname) {
         "  -mf max-faces          max face candidates processed per image, 1-20 (default = 5)\n"
         "                            raise this if legitimate photos have more than 5 faces;\n"
         "                            excess candidates beyond this cap are dropped by confidence score\n"
+        "\n"
+        "The following options are applied to the background only (faces are always\n"
+        "restored separately by GFPGAN), in this fixed pipeline order:\n"
+        "  white-balance -> vignette-correct -> scratch-removal -> denoise -> clahe ->\n"
+        "  detail-enhance -> sharpen\n"
+        "\n"
         "  -wb white-balance   0=off (default), 1=on - auto white balance (Gray-World)\n"
         "                            corrects color casts (fluorescent green/yellow tint, tungsten\n"
-        "                            orange tint, shade blue tint); applied before denoise/CLAHE/sharpen\n"
+        "                            orange tint, shade blue tint); applied first, before every\n"
+        "                            other effect below\n"
         "                            (requires opencv_contrib's xphoto module; no-op if not built with it)\n"
-        "  -de detail-enhance  0-100, default = 0 (off) - edge-preserving detail enhancement\n"
-        "                            more natural alternative/addition to -sp: enhances fine texture\n"
-        "                            while preserving major edges, so it avoids the haloing that -sp\n"
-        "                            can produce at high strength; applied after CLAHE, before -sp\n"
         "  -vg vignette-correct 0-100, default = 0 (off) - corrects dark corners/edges (vignetting)\n"
         "                            brightens the image radially (more toward the corners, none at\n"
         "                            the center); an approximate correction, not a lens-specific one;\n"
-        "                            applied right after -wb, before denoise\n"
+        "                            applied right after -wb, before -sr\n"
         "  -sr scratch-removal 0-100, default = 0 (off) - removes thin scratches/dust specks\n"
         "                            typical of old print/film scans, via inpainting; background\n"
         "                            only (face areas are always left untouched); applied right\n"
-        "                            after -vg, before denoise\n"
-        "\n"
-        "*Unmodifiable Options*\n"
-        "\n"
-        "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n",
+        "                            after -vg, before -dn\n"
+        "  -dn denoise             0-100, default = 0 (off) - reduces background grain/noise\n"
+        "                            (e.g. sensor noise, JPEG blockiness, scan grain); higher values\n"
+        "                            smooth more but can start to soften fine detail; applied right\n"
+        "                            after -sr, before -cl\n"
+        "  -cl clahe                0-100, default = 0 (off) - CLAHE local contrast enhancement\n"
+        "                            (Contrast Limited Adaptive Histogram Equalization); brings out\n"
+        "                            local detail in flat/washed-out areas without blowing out\n"
+        "                            highlights elsewhere; applied right after -dn, before -de\n"
+        "  -de detail-enhance  0-100, default = 0 (off) - edge-preserving detail enhancement\n"
+        "                            more natural alternative/addition to -sp: enhances fine texture\n"
+        "                            while preserving major edges, so it avoids the haloing that -sp\n"
+        "                            can produce at high strength; applied after -cl, before -sp\n"
+        "  -sp sharpen             0-100, default = 0 (off) - unsharp-mask style sharpening\n"
+        "                            boosts edge contrast for a crisper look; can produce haloing\n"
+        "                            (double-edge outlines) at high strength - try -de instead or\n"
+        "                            alongside it at a lower value; applied last, after -de\n",
         progname, DEFAULT_MODEL_DIR, DEFAULT_REALESRGAN_MODEL_DIR);
 }
 
@@ -710,9 +731,10 @@ int main(int argc, char **argv) {
 
     if (realesrganModelName != "realesrgan-x4plus"
         && realesrganModelName != "realesrgan-x4plus-anime"
+        && realesrganModelName != "realesrgan-x2plus"
         && realesrganModelName != "realesr-animevideov3") {
         fprintf(stderr, "Error: -rn model-name must be one of realesrgan-x4plus, "
-                         "realesrgan-x4plus-anime, realesr-animevideov3 (got '%s')\n\n",
+                         "realesrgan-x4plus-anime, realesrgan-x2plus, realesr-animevideov3 (got '%s')\n\n",
                 realesrganModelName.c_str());
         print_usage(argv[0]);
         return -1;
@@ -779,6 +801,10 @@ int main(int argc, char **argv) {
     // realesrgan-x4plus / realesrgan-x4plus-anime: 네트워크 구조 자체가 4배
     //   고정이라, 파일명에 배율이 붙지 않습니다. 최종 원하는 배율(-s)이
     //   4가 아니면 4배로 처리한 뒤 나중에 리사이즈합니다 (restore_one_image 참고).
+    // realesrgan-x2plus: 위와 같은 계열(RRDB)이지만 네트워크 구조 자체가 2배
+    //   고정입니다. x4plus 대비 GPU 연산량이 대략 절반이라, 저사양 GPU에서
+    //   화질과 속도의 절충안으로 씁니다. -s가 2가 아니면 2배로 처리한 뒤
+    //   나중에 리사이즈합니다(x4plus와 동일한 흐름, 기준 배율만 다름).
     // realesr-animevideov3: 배율별로 별도 모델(-x2/-x3/-x4)이 나뉘어 있어서,
     //   원하는 최종 배율(-s)에 맞는 파일을 바로 불러오면 되고, 후처리
     //   리사이즈가 필요 없습니다.
@@ -795,7 +821,11 @@ int main(int argc, char **argv) {
     } else {
         realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
         realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
-        real_esrgan.scale = 4;  // x4plus 계열은 네트워크 구조상 4배 고정
+        // x4plus / x4plus-anime는 네트워크 구조상 4배 고정, x2plus는 2배 고정.
+        // (x2plus는 입력 단에서 pixel-unshuffle로 공간 해상도를 먼저 절반으로
+        // 줄이고 그만큼 채널을 늘린 뒤 RRDB를 거치는 구조라, x4plus와 파라미터
+        // 수/레이어 수는 비슷해도 최종 네이티브 배율은 2배입니다.)
+        real_esrgan.scale = (realesrganModelName == "realesrgan-x2plus") ? 2 : 4;
     }
     real_esrgan.load(realesrganParam, realesrganModel);
     real_esrgan.tile_size = tilesize;   // -t 로 넘긴 값 적용 (기본 400)
