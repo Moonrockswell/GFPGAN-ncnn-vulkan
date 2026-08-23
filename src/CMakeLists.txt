@@ -47,6 +47,25 @@ else ()
     message(FATAL_ERROR "OpenCV Not Found!")
 endif ()
 
+# -------------- Auto-detect opencv_contrib's xphoto module ------------------#
+# The -wb (auto white balance) option uses cv::xphoto::GrayworldWB, which lives
+# in opencv_contrib and is NOT always installed alongside the main OpenCV
+# modules (e.g. a vcpkg "opencv4" install without the "contrib" feature won't
+# have it). Rather than hard-coding an assumption and breaking the build on
+# environments without it, we check at configure time and compile -wb as a
+# no-op if the header isn't available, so the build always succeeds either way.
+include(CheckIncludeFileCXX)
+set(CMAKE_REQUIRED_INCLUDES ${OpenCV_INCLUDE_DIRS})
+check_include_file_cxx("opencv2/xphoto.hpp" HAVE_XPHOTO_HEADER)
+unset(CMAKE_REQUIRED_INCLUDES)
+
+if (HAVE_XPHOTO_HEADER)
+    message(STATUS "opencv2/xphoto.hpp found - auto white balance (-wb) will be enabled")
+else ()
+    message(STATUS "opencv2/xphoto.hpp NOT found (opencv_contrib not installed) - "
+                    "auto white balance (-wb) will be compiled as a no-op")
+endif ()
+
 find_package(OpenMP REQUIRED)
 if (OPENMP_FOUND)
     message("OPENMP FOUND")
@@ -142,3 +161,9 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_executable(gfpgan-ncnn-vulkan gfpgan-ncnn-vulkan-demo.cpp gfpgan.cpp face.cpp realesrgan.cpp)
 target_link_libraries(gfpgan-ncnn-vulkan ${NCNN_GFPGAN_LINK_LIBRARIES} ${OpenCV_LIBS})
+
+if (HAVE_XPHOTO_HEADER)
+    target_compile_definitions(gfpgan-ncnn-vulkan PRIVATE HAVE_XPHOTO=1)
+else ()
+    target_compile_definitions(gfpgan-ncnn-vulkan PRIVATE HAVE_XPHOTO=0)
+endif ()
