@@ -15,11 +15,13 @@
 #define RESTORE_IMAGE_COLOR 0   //0-no color image, 1-coloring grayscale images
 
 // 자동 화이트밸런스(-wb)는 opencv_contrib의 xphoto 모듈이 필요합니다.
-// opencv_contrib 없이 빌드된 환경(xphoto.hpp가 없는 경우)이라면 이 값을
-// 0으로 바꿔서 컴파일하세요. 그러면 -wb 옵션은 그대로 받아들이되 아무
-// 효과도 적용하지 않는 no-op으로 동작합니다 (빌드 자체는 항상 성공).
+// CMakeLists.txt가 빌드 시점에 opencv2/xphoto.hpp 존재 여부를 자동으로
+// 감지해서 HAVE_XPHOTO를 정의해주므로 보통은 이 블록이 실행되지 않습니다.
+// 혹시 CMake 없이 이 파일 하나만 단독 컴파일하는 경우를 대비한 안전장치로,
+// 그런 경우의 기본값은 "없다고 가정(0)"으로 둡니다. contrib이 확실히 있는
+// 환경에서 단독 컴파일한다면 이 값을 1로 바꾸세요.
 #ifndef HAVE_XPHOTO
-#define HAVE_XPHOTO 1
+#define HAVE_XPHOTO 0
 #endif
 
 #if HAVE_XPHOTO
