@@ -87,6 +87,11 @@ static void print_usage(const char *progname) {
         "  -mf max-faces           max face candidates processed per image, 1-20 (default = 5)\n"
         "                          raise this if legitimate photos have more than 5 faces;\n"
         "                          excess candidates beyond this cap are dropped by confidence score\n"
+        "  -fr face-restore        0=off, 1=on (default) - face detection + GFPGAN face restoration\n"
+        "                          0 skips face detection/GFPGAN entirely and applies only the\n"
+        "                          RealESRGAN background upscale to the whole image; useful for\n"
+        "                          anime/illustration/3D-render input where a real-face detector\n"
+        "                          should not run or produces false positives\n"
         "\n"
         "The following options are applied to the background only (faces are always\n"
         "restored separately by GFPGAN), in this fixed pipeline order:\n"
@@ -485,7 +490,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
                                const std::string &inputPath, const std::string &outputPath,
                                int denoiseStrength, int sharpenStrength, int claheStrength, int scale,
                                size_t maxFacesPerImage, int whiteBalance, int detailEnhanceStrength,
-                               int vignetteStrength, int scratchStrength) {
+                               int vignetteStrength, int scratchStrength, int faceRestore) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
@@ -503,6 +508,12 @@ static bool restore_one_image(GFPGAN &gfpgan,
     cv::Mat bg_upsample;
     real_esrgan.tile_process(img, bg_upsample);
 
+    // 얼굴이 실제로 합성되는 영역을 누적할 마스크. 스크래치 제거(-sr)가
+    // 이 영역은 절대 건드리지 않고 배경에만 적용되도록 하는 데 씁니다.
+    // -fr 0(얼굴 복원 끔)이면 얼굴 영역이 없으므로 항상 빈 마스크로 남습니다.
+    cv::Mat faceRegionMask = cv::Mat::zeros(bg_upsample.size(), CV_8UC1);
+
+    if (faceRestore) {
     std::vector<Object> objects;
     // nms_threshold: 0.3 (원래 기본값) -> 0.45 로 상향.
     // 겹치는 검출 박스를 더 적극적으로 하나로 합쳐서, 만화/일러스트처럼
@@ -536,10 +547,6 @@ static bool restore_one_image(GFPGAN &gfpgan,
     // 합성됩니다.
     face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img, real_esrgan.scale);
 
-    // 얼굴이 실제로 합성되는 영역을 누적할 마스크. 스크래치 제거(-sr)가
-    // 이 영역은 절대 건드리지 않고 배경에만 적용되도록 하는 데 씁니다.
-    cv::Mat faceRegionMask = cv::Mat::zeros(bg_upsample.size(), CV_8UC1);
-
     for (size_t i = 0; i < objects.size(); i++) {
         ncnn::Mat gfpgan_result;
         gfpgan.process(trans_img[i], gfpgan_result);
@@ -549,6 +556,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
         paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample, faceRegionMask);
     }
+    } // faceRestore
 
     // RealESRGAN 배경 업스케일 + GFPGAN 얼굴 보정은 항상 내부적으로 모델
     // 네이티브 배율(realesrgan-x4plus 기준 4배)로 수행됩니다 (모델 구조 자체가
@@ -639,6 +647,7 @@ int main(int argc, char **argv) {
     int detailEnhanceStrength = 0;  // -de, 0-100, default off, edge-preserving 디테일 향상
     int vignetteStrength = 0;  // -vg, 0-100, default off, 비네팅(가장자리 어두워짐) 보정
     int scratchStrength = 0;  // -sr, 0-100, default off, 스크래치/먼지 제거(배경 전용, 인페인팅)
+    int faceRestore = 1;  // -fr, 0=끔/1=켬(기본), 얼굴 검출 + GFPGAN 얼굴 복원 여부
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -688,6 +697,8 @@ int main(int argc, char **argv) {
             vignetteStrength = std::atoi(argv[++i]);
         } else if (arg == "-sr" && i + 1 < argc) {
             scratchStrength = std::atoi(argv[++i]);
+        } else if (arg == "-fr" && i + 1 < argc) {
+            faceRestore = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -874,10 +885,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
             if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #else
             if (restore_one_image(gfpgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #endif
                 processed++;
             }
@@ -899,10 +910,10 @@ int main(int argc, char **argv) {
 
 #if RESTORE_WHOLE_IMAGE
         if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #else
         if (!restore_one_image(gfpgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #endif
             return -1;
         }
