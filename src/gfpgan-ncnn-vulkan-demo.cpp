@@ -58,10 +58,20 @@ static void print_usage(const char *progname) {
         "  \n"
         "  -m model-path       folder path to the GFPGAN (face) models (default=%s)\n"
         "  -rm model-path     folder path to the RealESRGAN (background) models (default=%s)\n"
+        "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n"
+        "                            (fixed, cannot be changed)\n"
         "  -rn model-name    RealESRGAN model to use, file names kept exactly as officially\n"
-        "                            distributed - default=realesrgan-x4plus\n"
-        "                            realesrgan-x2plus          general photos, native 2x (lighter GPU load)\n"
-        "                            realesrgan-x4plus          general photos, native 4x (default)\n"
+        "                            distributed. -rn 을 직접 지정하지 않으면 -s 값에 맞춰\n"
+        "                            자동으로 고릅니다: -s 1/2 -> realesrgan-x2plus,\n"
+        "                            -s 3/4 -> realesrgan-x4plus (네이티브 배율에 가장\n"
+        "                            가까운 모델을 써서 GPU 낭비와 과도한 확대를 둘 다 피함)\n"
+        "                            realesrgan-x2plus          general photos, native 2x -\n"
+        "                                                             about half the GPU work of x4plus,\n"
+        "                                                             the auto default for -s 1/2\n"
+        "                            realesrgan-x4plus          general photos, native 4x - sharper/\n"
+        "                                                             more detail than x2plus, but roughly\n"
+        "                                                             double the GPU work; the auto default\n"
+        "                                                             for -s 3/4\n"
         "                            realesrgan-x4plus-anime  anime / illustration art\n"
         "                            realesr-animevideov3      video frames (lightweight)\n"
         "  -f output format     output image format (jpg/png/webp, default=png)\n"
@@ -71,39 +81,47 @@ static void print_usage(const char *progname) {
         "  -s scale                 final output scale relative to original: 1/2/3/4 (default = 2)\n"
         "                            realesrgan-x4plus / -anime always run internally at their\n"
         "                            native 4x scale, then resize to whichever of 1/2/3/4 you pick;\n"
-        "                            realesrgan-x2plus runs internally at its native 2x scale, then\n"
-        "                            resizes the same way;\n"
         "                            realesr-animevideov3 loads a separate model per scale (2/3/4)\n"
         "                            and outputs it directly, no resize needed (1 falls back to a\n"
         "                            post-resize since there is no native 1x model)\n"
         "  -mf max-faces          max face candidates processed per image, 1-20 (default = 5)\n"
         "                            raise this if legitimate photos have more than 5 faces;\n"
         "                            excess candidates beyond this cap are dropped by confidence score\n"
+        "\n"
+        "The following options are applied to the background only (faces are always\n"
+        "restored separately by GFPGAN), in this fixed pipeline order:\n"
+        "  white-balance -> vignette-correct -> scratch-removal -> denoise -> clahe ->\n"
+        "  detail-enhance -> sharpen\n"
+        "\n"
         "  -wb white-balance   0=off (default), 1=on - auto white balance (Gray-World)\n"
         "                            corrects color casts (fluorescent green/yellow tint, tungsten\n"
-        "                            orange tint, shade blue tint); applied before denoise/CLAHE/sharpen\n"
+        "                            orange tint, shade blue tint); applied first, before every\n"
+        "                            other effect below\n"
         "                            (requires opencv_contrib's xphoto module; no-op if not built with it)\n"
-        "  -de detail-enhance  0-100, default = 0 (off) - edge-preserving detail enhancement\n"
-        "                            more natural alternative/addition to -sp: enhances fine texture\n"
-        "                            while preserving major edges, so it avoids the haloing that -sp\n"
-        "                            can produce at high strength; applied after CLAHE, before -sp\n"
         "  -vg vignette-correct 0-100, default = 0 (off) - corrects dark corners/edges (vignetting)\n"
         "                            brightens the image radially (more toward the corners, none at\n"
         "                            the center); an approximate correction, not a lens-specific one;\n"
-        "                            applied right after -wb, before denoise\n"
+        "                            applied right after -wb, before -sr\n"
         "  -sr scratch-removal 0-100, default = 0 (off) - removes thin scratches/dust specks\n"
         "                            typical of old print/film scans, via inpainting; background\n"
         "                            only (face areas are always left untouched); applied right\n"
-        "                            after -vg, before denoise\n"
-        "  -fr face-restore      0=off, 1=on (default) - face detection + GFPGAN face restore\n"
-        "                            set to 0 to skip face detect/restore entirely and only run\n"
-        "                            the RealESRGAN background upscale on the whole image; use this\n"
-        "                            for anime/illustration/3D-render input where a real-photo face\n"
-        "                            detector would misfire or shouldn't be applied at all\n"
-        "\n"
-        "*Unmodifiable Options*\n"
-        "\n"
-        "  -n model name       GFPGANCleanv1-NoCE-C2 supports only one type of model\n",
+        "                            after -vg, before -dn\n"
+        "  -dn denoise             0-100, default = 0 (off) - reduces background grain/noise\n"
+        "                            (e.g. sensor noise, JPEG blockiness, scan grain); higher values\n"
+        "                            smooth more but can start to soften fine detail; applied right\n"
+        "                            after -sr, before -cl\n"
+        "  -cl clahe                0-100, default = 0 (off) - CLAHE local contrast enhancement\n"
+        "                            (Contrast Limited Adaptive Histogram Equalization); brings out\n"
+        "                            local detail in flat/washed-out areas without blowing out\n"
+        "                            highlights elsewhere; applied right after -dn, before -de\n"
+        "  -de detail-enhance  0-100, default = 0 (off) - edge-preserving detail enhancement\n"
+        "                            more natural alternative/addition to -sp: enhances fine texture\n"
+        "                            while preserving major edges, so it avoids the haloing that -sp\n"
+        "                            can produce at high strength; applied after -cl, before -sp\n"
+        "  -sp sharpen             0-100, default = 0 (off) - unsharp-mask style sharpening\n"
+        "                            boosts edge contrast for a crisper look; can produce haloing\n"
+        "                            (double-edge outlines) at high strength - try -de instead or\n"
+        "                            alongside it at a lower value; applied last, after -de\n",
         progname, DEFAULT_MODEL_DIR, DEFAULT_REALESRGAN_MODEL_DIR);
 }
 
@@ -467,7 +485,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
                                const std::string &inputPath, const std::string &outputPath,
                                int denoiseStrength, int sharpenStrength, int claheStrength, int scale,
                                size_t maxFacesPerImage, int whiteBalance, int detailEnhanceStrength,
-                               int vignetteStrength, int scratchStrength, int faceRestore) {
+                               int vignetteStrength, int scratchStrength) {
     cv::Mat img = cv::imread(inputPath, 1);
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
@@ -485,58 +503,51 @@ static bool restore_one_image(GFPGAN &gfpgan,
     cv::Mat bg_upsample;
     real_esrgan.tile_process(img, bg_upsample);
 
+    std::vector<Object> objects;
+    // nms_threshold: 0.3 (원래 기본값) -> 0.45 로 상향.
+    // 겹치는 검출 박스를 더 적극적으로 하나로 합쳐서, 만화/일러스트처럼
+    // 실사 얼굴 검출기가 오작동하기 쉬운 이미지에서 같은 부위 주변에
+    // 중복으로 잡히는 오탐지 박스 수를 줄입니다. prob_threshold(0.7)는 그대로.
+    face_detector.detect(img, objects, 0.7f, 0.45f);
+
+    // 만화/일러스트/스캔 이미지는 실사 얼굴 학습 기반 검출기 특성상
+    // 눈/무늬 등을 얼굴로 오탐지해서 후보가 비정상적으로 많이 나올 수 있습니다.
+    // 후보 하나당 GFPGAN 512x512 GPU 추론이 한 번씩 더 들어가므로, 오탐지가
+    // 쌓이면 VRAM/처리시간이 누적되어 device lost(vkQueueSubmit failed)로
+    // 이어질 수 있습니다. 점수(score) 상위 kMaxFacesPerImage개만 남겨서
+    // 이런 오탐지 폭주가 GPU를 죽이는 것을 막습니다. 정상적인 인물 사진은
+    // 보통 이 한도 안에 들어오므로 실질적인 영향이 없습니다.
+    // 상한값은 -mf 옵션으로 조절 가능 (기본 5, 단체 사진처럼 얼굴이 실제로
+    // 많은 경우 -mf 10 등으로 올려서 정상 얼굴이 잘리는 것을 방지).
+    if (objects.size() > maxFacesPerImage) {
+        std::sort(objects.begin(), objects.end(),
+                   [](const Object &a, const Object &b) { return a.score > b.score; });
+        fprintf(stderr, "Warning: %zu face candidates detected, keeping top %zu by confidence "
+                         "(likely false positives on illustration/scan input)\n",
+                objects.size(), maxFacesPerImage);
+        objects.resize(maxFacesPerImage);
+    }
+
+    std::vector<cv::Mat> trans_img;
+    std::vector<cv::Mat> trans_matrix_inv;
+    // real_esrgan.scale: realesrgan-x4plus 모델의 네이티브 배율(4).
+    // bg_upsample이 실제로 이 배율로 만들어지므로, 얼굴을 붙여넣을 좌표
+    // 변환도 반드시 같은 배율을 써야 얼굴이 배경 위 정확한 위치에
+    // 합성됩니다.
+    face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img, real_esrgan.scale);
+
     // 얼굴이 실제로 합성되는 영역을 누적할 마스크. 스크래치 제거(-sr)가
     // 이 영역은 절대 건드리지 않고 배경에만 적용되도록 하는 데 씁니다.
-    // -fr 0(얼굴 작업 끔)이면 얼굴 영역이 없으므로 항상 빈 마스크로 남습니다.
     cv::Mat faceRegionMask = cv::Mat::zeros(bg_upsample.size(), CV_8UC1);
 
-    // -fr 0: 얼굴 검출/GFPGAN 복원을 완전히 건너뛰고 RealESRGAN 배경
-    // 업스케일 결과만 사용합니다. 애니메이션/일러스트/3D 렌더 이미지처럼
-    // 실사 얼굴 학습 기반 검출기가 오탐지하거나 애초에 적용할 필요가
-    // 없는 입력에 사용합니다.
-    if (faceRestore) {
-        std::vector<Object> objects;
-        // nms_threshold: 0.3 (원래 기본값) -> 0.45 로 상향.
-        // 겹치는 검출 박스를 더 적극적으로 하나로 합쳐서, 만화/일러스트처럼
-        // 실사 얼굴 검출기가 오작동하기 쉬운 이미지에서 같은 부위 주변에
-        // 중복으로 잡히는 오탐지 박스 수를 줄입니다. prob_threshold(0.7)는 그대로.
-        face_detector.detect(img, objects, 0.7f, 0.45f);
+    for (size_t i = 0; i < objects.size(); i++) {
+        ncnn::Mat gfpgan_result;
+        gfpgan.process(trans_img[i], gfpgan_result);
 
-        // 만화/일러스트/스캔 이미지는 실사 얼굴 학습 기반 검출기 특성상
-        // 눈/무늬 등을 얼굴로 오탐지해서 후보가 비정상적으로 많이 나올 수 있습니다.
-        // 후보 하나당 GFPGAN 512x512 GPU 추론이 한 번씩 더 들어가므로, 오탐지가
-        // 쌓이면 VRAM/처리시간이 누적되어 device lost(vkQueueSubmit failed)로
-        // 이어질 수 있습니다. 점수(score) 상위 kMaxFacesPerImage개만 남겨서
-        // 이런 오탐지 폭주가 GPU를 죽이는 것을 막습니다. 정상적인 인물 사진은
-        // 보통 이 한도 안에 들어오므로 실질적인 영향이 없습니다.
-        // 상한값은 -mf 옵션으로 조절 가능 (기본 5, 단체 사진처럼 얼굴이 실제로
-        // 많은 경우 -mf 10 등으로 올려서 정상 얼굴이 잘리는 것을 방지).
-        if (objects.size() > maxFacesPerImage) {
-            std::sort(objects.begin(), objects.end(),
-                       [](const Object &a, const Object &b) { return a.score > b.score; });
-            fprintf(stderr, "Warning: %zu face candidates detected, keeping top %zu by confidence "
-                             "(likely false positives on illustration/scan input)\n",
-                    objects.size(), maxFacesPerImage);
-            objects.resize(maxFacesPerImage);
-        }
+        cv::Mat restored_face;
+        to_ocv(gfpgan_result, restored_face);
 
-        std::vector<cv::Mat> trans_img;
-        std::vector<cv::Mat> trans_matrix_inv;
-        // real_esrgan.scale: 선택된 RealESRGAN 모델의 네이티브 배율
-        // (x2plus=2, x4plus/-anime=4, animevideov3=2/3/4). bg_upsample이
-        // 실제로 이 배율로 만들어지므로, 얼굴을 붙여넣을 좌표 변환도
-        // 반드시 같은 배율을 써야 얼굴이 배경 위 정확한 위치에 합성됩니다.
-        face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img, real_esrgan.scale);
-
-        for (size_t i = 0; i < objects.size(); i++) {
-            ncnn::Mat gfpgan_result;
-            gfpgan.process(trans_img[i], gfpgan_result);
-
-            cv::Mat restored_face;
-            to_ocv(gfpgan_result, restored_face);
-
-            paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample, faceRegionMask);
-        }
+        paste_faces_to_input_image(restored_face, trans_matrix_inv[i], bg_upsample, faceRegionMask);
     }
 
     // RealESRGAN 배경 업스케일 + GFPGAN 얼굴 보정은 항상 내부적으로 모델
@@ -614,7 +625,9 @@ int main(int argc, char **argv) {
     std::string outputpath;
     std::string modeldir = DEFAULT_MODEL_DIR;
     std::string realesrganModelDir = DEFAULT_REALESRGAN_MODEL_DIR;  // -rm
-    std::string realesrganModelName = "realesrgan-x4plus";  // -rn, 이미지 종류에 맞게 선택
+    std::string realesrganModelName = "realesrgan-x2plus";  // -rn, 이미지 종류에 맞게 선택
+                                      // (명시적으로 안 주면 -s 값을 보고 아래에서 자동 결정됨)
+    bool realesrganModelNameExplicit = false;  // 사용자가 -rn 을 직접 지정했는지 여부
     std::string format;
     int tilesize = 400;  // background upscale tile size, overridable via -t
     int denoiseStrength = 0;  // -dn, 0-100, default off
@@ -626,7 +639,6 @@ int main(int argc, char **argv) {
     int detailEnhanceStrength = 0;  // -de, 0-100, default off, edge-preserving 디테일 향상
     int vignetteStrength = 0;  // -vg, 0-100, default off, 비네팅(가장자리 어두워짐) 보정
     int scratchStrength = 0;  // -sr, 0-100, default off, 스크래치/먼지 제거(배경 전용, 인페인팅)
-    int faceRestore = 1;  // -fr, 0=off/1=on(기본), 얼굴 검출+GFPGAN 복원 여부
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -653,6 +665,7 @@ int main(int argc, char **argv) {
             realesrganModelDir = argv[++i];
         } else if (arg == "-rn" && i + 1 < argc) {
             realesrganModelName = argv[++i];
+            realesrganModelNameExplicit = true;
         } else if (arg == "-f" && i + 1 < argc) {
             format = argv[++i];
         } else if (arg == "-t" && i + 1 < argc) {
@@ -675,8 +688,6 @@ int main(int argc, char **argv) {
             vignetteStrength = std::atoi(argv[++i]);
         } else if (arg == "-sr" && i + 1 < argc) {
             scratchStrength = std::atoi(argv[++i]);
-        } else if (arg == "-fr" && i + 1 < argc) {
-            faceRestore = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -726,12 +737,22 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    if (realesrganModelName != "realesrgan-x2plus"
-        && realesrganModelName != "realesrgan-x4plus"
+    // -rn 을 직접 지정하지 않았다면, -s 값에 맞춰 기본 모델을 자동으로 고릅니다.
+    // x2plus(네이티브 2배)로 -s 3/4를 만들면 네이티브 배율 이상으로 다시 확대해야
+    // 해서 x4plus(네이티브 4배)를 그대로 쓰는 것보다 디테일이 아쉬울 수 있고,
+    // 반대로 -s 1/2에 x4plus를 쓰면 어차피 다시 축소할 4배 연산을 굳이 다 돌리는
+    // 셈이라 GPU가 낭비됩니다. 그래서 요청한 -s 값과 가장 가까운 네이티브 배율의
+    // 모델을 기본으로 선택합니다.
+    if (!realesrganModelNameExplicit) {
+        realesrganModelName = (scale <= 2) ? "realesrgan-x2plus" : "realesrgan-x4plus";
+    }
+
+    if (realesrganModelName != "realesrgan-x4plus"
         && realesrganModelName != "realesrgan-x4plus-anime"
+        && realesrganModelName != "realesrgan-x2plus"
         && realesrganModelName != "realesr-animevideov3") {
-        fprintf(stderr, "Error: -rn model-name must be one of realesrgan-x2plus, realesrgan-x4plus, "
-                         "realesrgan-x4plus-anime, realesr-animevideov3 (got '%s')\n\n",
+        fprintf(stderr, "Error: -rn model-name must be one of realesrgan-x4plus, "
+                         "realesrgan-x4plus-anime, realesrgan-x2plus, realesr-animevideov3 (got '%s')\n\n",
                 realesrganModelName.c_str());
         print_usage(argv[0]);
         return -1;
@@ -773,12 +794,6 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    if (faceRestore != 0 && faceRestore != 1) {
-        fprintf(stderr, "Error: -fr face-restore must be 0 (off) or 1 (on, default) (got '%d')\n\n", faceRestore);
-        print_usage(argv[0]);
-        return -1;
-    }
-
     if (!fs::exists(imagepath)) {
         fprintf(stderr, "Error: input path '%s' does not exist\n", imagepath.c_str());
         return -1;
@@ -793,27 +808,21 @@ int main(int argc, char **argv) {
     }
 
     GFPGAN gfpgan;
-    if (faceRestore) {
-        // -fr 0(얼굴 작업 끔)이면 GFPGAN 모델을 아예 불러오지 않습니다.
-        // 애니메이션/일러스트/3D 렌더 전용 배치에서 gfpgan-models 폴더가
-        // 없어도 동작하게 되고, 로딩 시간/메모리도 절약됩니다.
-        gfpgan.load(modeldir + "/encoder.param", modeldir + "/encoder.bin", modeldir + "/style.bin");
-    }
+    gfpgan.load(modeldir + "/encoder.param", modeldir + "/encoder.bin", modeldir + "/style.bin");
 
 #if RESTORE_WHOLE_IMAGE
     Face face_detector;
-    if (faceRestore) {
-        face_detector.load(modeldir + "/yolov5-blazeface.param", modeldir + "/yolov5-blazeface.bin");
-    }
+    face_detector.load(modeldir + "/yolov5-blazeface.param", modeldir + "/yolov5-blazeface.bin");
 
     RealESRGAN real_esrgan;
     // 공식 realesrgan-ncnn-vulkan 배포본의 파일명을 변형 없이 그대로 사용합니다.
     // realesrgan-x4plus / realesrgan-x4plus-anime: 네트워크 구조 자체가 4배
     //   고정이라, 파일명에 배율이 붙지 않습니다. 최종 원하는 배율(-s)이
     //   4가 아니면 4배로 처리한 뒤 나중에 리사이즈합니다 (restore_one_image 참고).
-    // realesrgan-x2plus: 네트워크 구조 자체가 2배 고정입니다. x4plus 계열보다
-    //   타일당 GPU 부담이 가벼워 저사양/구형 GPU에 안전한 선택입니다. 최종
-    //   원하는 배율(-s)이 2가 아니면 2배로 처리한 뒤 나중에 리사이즈합니다.
+    // realesrgan-x2plus: 위와 같은 계열(RRDB)이지만 네트워크 구조 자체가 2배
+    //   고정입니다. x4plus 대비 GPU 연산량이 대략 절반이라, 저사양 GPU에서
+    //   화질과 속도의 절충안으로 씁니다. -s가 2가 아니면 2배로 처리한 뒤
+    //   나중에 리사이즈합니다(x4plus와 동일한 흐름, 기준 배율만 다름).
     // realesr-animevideov3: 배율별로 별도 모델(-x2/-x3/-x4)이 나뉘어 있어서,
     //   원하는 최종 배율(-s)에 맞는 파일을 바로 불러오면 되고, 후처리
     //   리사이즈가 필요 없습니다.
@@ -827,14 +836,14 @@ int main(int argc, char **argv) {
         realesrganParam = realesrganModelDir + "/" + realesrganModelName + suffix + ".param";
         realesrganModel = realesrganModelDir + "/" + realesrganModelName + suffix + ".bin";
         real_esrgan.scale = modelScale;
-    } else if (realesrganModelName == "realesrgan-x2plus") {
-        realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
-        realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
-        real_esrgan.scale = 2;  // x2plus는 네트워크 구조상 2배 고정
     } else {
         realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
         realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
-        real_esrgan.scale = 4;  // x4plus 계열은 네트워크 구조상 4배 고정
+        // x4plus / x4plus-anime는 네트워크 구조상 4배 고정, x2plus는 2배 고정.
+        // (x2plus는 입력 단에서 pixel-unshuffle로 공간 해상도를 먼저 절반으로
+        // 줄이고 그만큼 채널을 늘린 뒤 RRDB를 거치는 구조라, x4plus와 파라미터
+        // 수/레이어 수는 비슷해도 최종 네이티브 배율은 2배입니다.)
+        real_esrgan.scale = (realesrganModelName == "realesrgan-x2plus") ? 2 : 4;
     }
     real_esrgan.load(realesrganParam, realesrganModel);
     real_esrgan.tile_size = tilesize;   // -t 로 넘긴 값 적용 (기본 400)
@@ -865,10 +874,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
             if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #else
             if (restore_one_image(gfpgan, entry.path().string(), outPath,
-                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
+                                   denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #endif
                 processed++;
             }
@@ -890,10 +899,10 @@ int main(int argc, char **argv) {
 
 #if RESTORE_WHOLE_IMAGE
         if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #else
         if (!restore_one_image(gfpgan, imagepath, outPath,
-                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
+                                denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength)) {
 #endif
             return -1;
         }
