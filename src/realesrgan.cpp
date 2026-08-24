@@ -1,135 +1,326 @@
+// realesrgan implemented with ncnn library
+//
+// GPU 셰이더 기반 타일 파이프라인 버전 (재구성본).
+//
+// 이 파일은 원본이 실수로 덮어써져서, 다음 근거를 바탕으로 xinntao의 공식
+// realesrgan-ncnn-vulkan 소스(https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan)의
+// 타일 처리 파이프라인을 참고해 이 프로젝트의 실제 헤더/셰이더/CMakeLists에
+// 맞춰 다시 작성했습니다:
+//   - realesrgan_preproc.comp / realesrgan_postproc.comp 가 공식 배포판과
+//     100% 동일 (diff 결과 완전 일치)
+//   - CMakeLists.txt가 이 두 셰이더만 fp32/fp16s/int8s 세 변형으로 컴파일
+//     (tta 변형은 컴파일하지 않음 -> tta 미지원)
+//   - realesrgan.h가 공식 헤더에서 bicubic_2x/3x/4x(알파 채널용), wstring
+//     오버로드를 제거하고, process()->tile_process(cv::Mat 기반)로,
+//     tilesize/prepadding -> tile_size/tile_pad 로 이름을 맞춘 축소판
+//   - 이전에 실제로 겪었던 에러 로그(find_blob_index_by_name input failed,
+//     "data"를 써보라는 힌트)로 볼 때, 원본은 공식 소스의 "data" 대신
+//     "input" 블롭 이름을 썼던 것으로 확인됨 -> 아래에서 "input"/"output" 사용
+//
+// 알파 채널(RGBA) 입력은 지원하지 않습니다 (헤더에 bicubic_2x/3x/4x 멤버가
+// 없어서 알파 채널 업스케일 경로 자체가 빠져 있음). gfpgan-ncnn-vulkan-demo.cpp
+// 쪽에서 cv::imread(..., 1)로 항상 3채널 BGR로 읽어오므로 문제 없습니다.
+// TTA(8-way test-time augmentation)도 셰이더가 컴파일되어 있지 않아 미지원이며,
+// tta_mode 멤버는 헤더와의 호환을 위해서만 남겨두고 실제로는 사용하지 않습니다.
+
 #include "realesrgan.h"
 
-RealESRGAN::RealESRGAN() {
+#include <algorithm>
+#include <vector>
+
+static const uint32_t realesrgan_preproc_spv_data[] = {
+    #include "realesrgan_preproc.spv.hex.h"
+};
+static const uint32_t realesrgan_preproc_fp16s_spv_data[] = {
+    #include "realesrgan_preproc_fp16s.spv.hex.h"
+};
+static const uint32_t realesrgan_preproc_int8s_spv_data[] = {
+    #include "realesrgan_preproc_int8s.spv.hex.h"
+};
+static const uint32_t realesrgan_postproc_spv_data[] = {
+    #include "realesrgan_postproc.spv.hex.h"
+};
+static const uint32_t realesrgan_postproc_fp16s_spv_data[] = {
+    #include "realesrgan_postproc_fp16s.spv.hex.h"
+};
+static const uint32_t realesrgan_postproc_int8s_spv_data[] = {
+    #include "realesrgan_postproc_int8s.spv.hex.h"
+};
+
+RealESRGAN::RealESRGAN(int gpuid, bool _tta_mode)
+{
     net.opt.use_vulkan_compute = true;
-    net.opt.num_threads = 4;
-    // realesrgan-x4plus 모델은 네트워크 구조 자체가 4배 업스케일로 고정되어
-    // 있습니다(2배/3배로 학습된 모델이 아님). 최종 출력 배율을 2/3배로
-    // 낮추고 싶을 때는, 이 4배 네이티브 결과를 만든 뒤 호출부에서 원하는
-    // 배율로 다시 축소(resize)하는 방식으로 처리합니다.
+    net.opt.use_fp16_packed = true;
+    net.opt.use_fp16_storage = true;
+    net.opt.use_fp16_arithmetic = false;
+    net.opt.use_int8_storage = true;
+    net.opt.use_int8_arithmetic = false;
+
+    net.set_vulkan_device(gpuid);
+
+    realesrgan_preproc = 0;
+    realesrgan_postproc = 0;
+    tta_mode = _tta_mode; // 셰이더 미컴파일로 현재 미사용, 헤더 호환용 보관
+
+    // 아래 세 값은 -rn 으로 어떤 모델이 로드되는지에 따라
+    // gfpgan-ncnn-vulkan-demo.cpp의 main()에서 다시 설정됩니다.
     scale = 4;
     tile_size = 400;
     tile_pad = 10;
 }
 
-RealESRGAN::~RealESRGAN() {
+RealESRGAN::~RealESRGAN()
+{
+    delete realesrgan_preproc;
+    delete realesrgan_postproc;
+
     net.clear();
 }
 
-int RealESRGAN::load(const std::string &param_path, const std::string &model_path) {
-    int ret = net.load_param(param_path.c_str());
-    if (ret < 0) {
-        fprintf(stderr, "open param file %s failed\n", param_path.c_str());
-        return -1;
-    }
-    ret = net.load_model(model_path.c_str());
-    if (ret < 0) {
-        fprintf(stderr, "open bin file %s failed\n", model_path.c_str());
+int RealESRGAN::load(const std::string& parampath, const std::string& modelpath)
+{
+    int ret = net.load_param(parampath.c_str());
+    if (ret < 0)
+    {
+        fprintf(stderr, "open param file %s failed\n", parampath.c_str());
         return -1;
     }
 
-    return 0;
-}
+    ret = net.load_model(modelpath.c_str());
+    if (ret < 0)
+    {
+        fprintf(stderr, "open bin file %s failed\n", modelpath.c_str());
+        return -1;
+    }
 
-cv::Mat RealESRGAN::to_ocv(const cv::Mat &source, const ncnn::Mat &result) {
-    cv::Mat cv_result_32F = cv::Mat::zeros(cv::Size(result.w, result.h), CV_32FC3);
-    for (int i = 0; i < result.h; i++) {
-        for (int j = 0; j < result.w; j++) {
-            cv_result_32F.at<cv::Vec3f>(i, j)[2] = result.channel(0)[i * result.w + j];
-            cv_result_32F.at<cv::Vec3f>(i, j)[1] = result.channel(1)[i * result.w + j];
-            cv_result_32F.at<cv::Vec3f>(i, j)[0] = result.channel(2)[i * result.w + j];
+    // preprocess / postprocess GPU 파이프라인 초기화
+    {
+        std::vector<ncnn::vk_specialization_type> specializations(1);
+        // OpenCV(cv::imread)는 항상 BGR로 읽어오므로, 플랫폼(_WIN32) 여부와
+        // 무관하게 항상 bgr=1로 고정합니다 (공식 소스는 stb_image/webp 기준으로
+        // 플랫폼별 분기가 있었지만, 이 프로젝트는 항상 OpenCV를 씁니다).
+        specializations[0].i = 1;
+
+        realesrgan_preproc = new ncnn::Pipeline(net.vulkan_device());
+        realesrgan_preproc->set_optimal_local_size_xyz(32, 32, 3);
+
+        realesrgan_postproc = new ncnn::Pipeline(net.vulkan_device());
+        realesrgan_postproc->set_optimal_local_size_xyz(32, 32, 3);
+
+        if (net.opt.use_fp16_storage && net.opt.use_int8_storage)
+        {
+            realesrgan_preproc->create(realesrgan_preproc_int8s_spv_data, sizeof(realesrgan_preproc_int8s_spv_data), specializations);
+            realesrgan_postproc->create(realesrgan_postproc_int8s_spv_data, sizeof(realesrgan_postproc_int8s_spv_data), specializations);
+        }
+        else if (net.opt.use_fp16_storage)
+        {
+            realesrgan_preproc->create(realesrgan_preproc_fp16s_spv_data, sizeof(realesrgan_preproc_fp16s_spv_data), specializations);
+            realesrgan_postproc->create(realesrgan_postproc_fp16s_spv_data, sizeof(realesrgan_postproc_fp16s_spv_data), specializations);
+        }
+        else
+        {
+            realesrgan_preproc->create(realesrgan_preproc_spv_data, sizeof(realesrgan_preproc_spv_data), specializations);
+            realesrgan_postproc->create(realesrgan_postproc_spv_data, sizeof(realesrgan_postproc_spv_data), specializations);
         }
     }
 
-    cv::Mat cv_result_8U;
-    cv_result_32F.convertTo(cv_result_8U, CV_8UC3, 255.0, 0);
-
-    return cv_result_8U;
-}
-
-int RealESRGAN::preprocess(const cv::Mat &img, cv::Mat &pad_img, int &img_pad_h, int &img_pad_w) {
-    if (img.cols % 2 != 0) {
-        img_pad_w = (2 - img.cols % 2);
-    }
-    if (img.rows % 2 != 0) {
-        img_pad_h = (2 - img.rows % 2);
-    }
-    cv::copyMakeBorder(img, pad_img, 0, img_pad_h, 0, img_pad_w, cv::BORDER_CONSTANT, cv::Scalar(0));
-
     return 0;
 }
 
-int RealESRGAN::inference(const cv::Mat &in, ncnn::Mat &out, int w, int h) {
-    ncnn::Mat ncnn_in = ncnn::Mat::from_pixels(in.data, ncnn::Mat::PIXEL_BGR2RGB, w, h);
+int RealESRGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
+{
+    // 이 프로젝트는 항상 3채널 BGR(cv::imread(..., 1))만 다룹니다.
+    const int channels = 3;
+    const int w = inimage.cols;
+    const int h = inimage.rows;
 
-    ncnn_in.substract_mean_normalize(0, norm_vals);
-    ncnn::Extractor ex = net.create_extractor();
-    ex.input("input", ncnn_in);
-    ex.extract("output", out);
+    outimage.create(h * scale, w * scale, CV_8UC3);
 
-    return 0;
-}
+    const unsigned char* pixeldata = inimage.isContinuous() ? inimage.data : nullptr;
+    cv::Mat inimage_cont;
+    if (!pixeldata)
+    {
+        // ROI 등으로 메모리가 연속이 아닌 경우를 대비한 안전장치
+        inimage_cont = inimage.clone();
+        pixeldata = inimage_cont.data;
+    }
 
-int RealESRGAN::tile_process(const cv::Mat &inimage, cv::Mat &outimage) {
-    cv::Mat pad_inimage;
-    int img_pad_w = 0, img_pad_h = 0;
-    preprocess(inimage, pad_inimage, img_pad_w, img_pad_h);
+    const int TILE_SIZE_X = tile_size;
+    const int TILE_SIZE_Y = tile_size;
+    const int prepadding = tile_pad;
 
-    int tiles_x = std::ceil((float) inimage.cols / tile_size);
-    int tiles_y = std::ceil((float) inimage.rows / tile_size);
+    ncnn::VkAllocator* blob_vkallocator = net.vulkan_device()->acquire_blob_allocator();
+    ncnn::VkAllocator* staging_vkallocator = net.vulkan_device()->acquire_staging_allocator();
 
-    // 이전에는 여기 리터럴 2가 하드코딩되어 있어서, scale 멤버 변수를
-    // 2가 아닌 값(예: realesrgan-x4plus의 4배)으로 바꾸면 출력 캔버스
-    // 크기와 아래 타일 배치 좌표 계산(* scale)이 서로 어긋나는 잠재
-    // 버그가 있었습니다. scale로 통일해서 실제 모델 배율과 항상 맞도록
-    // 고쳤습니다.
-    cv::Mat out = cv::Mat(cv::Size(pad_inimage.cols * scale, pad_inimage.rows * scale), CV_8UC3);
-    for (int i = 0; i < tiles_y; i++) {
-        for (int j = 0; j < tiles_x; j++) {
-            int ofs_x = j * tile_size;
-            int ofs_y = i * tile_size;
+    ncnn::Option opt = net.opt;
+    opt.blob_vkallocator = blob_vkallocator;
+    opt.workspace_vkallocator = blob_vkallocator;
+    opt.staging_vkallocator = staging_vkallocator;
 
-            int input_start_x = ofs_x;
-            int input_end_x = std::min(ofs_x + tile_size, pad_inimage.cols);
-            int input_start_y = ofs_y;
-            int input_end_y = std::min(ofs_y + tile_size, pad_inimage.rows);
+    const int xtiles = (w + TILE_SIZE_X - 1) / TILE_SIZE_X;
+    const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
 
-            int input_start_x_pad = std::max(input_start_x - tile_pad, 0);
-            int input_end_x_pad = std::min(input_end_x + tile_pad, pad_inimage.cols);
-            int input_start_y_pad = std::max(input_start_y - tile_pad, 0);
-            int input_end_y_pad = std::min(input_end_y + tile_pad, pad_inimage.rows);
+    const size_t in_out_tile_elemsize = opt.use_fp16_storage ? 2u : 4u;
 
-            int input_tile_width = input_end_x - input_start_x;
-            int input_tile_height = input_end_y - input_start_y;
+    for (int yi = 0; yi < ytiles; yi++)
+    {
+        int in_tile_y0 = std::max(yi * TILE_SIZE_Y - prepadding, 0);
+        int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding, h);
 
-            cv::Mat input_tile = pad_inimage(
-                    cv::Rect(input_start_x_pad, input_start_y_pad, input_end_x_pad - input_start_x_pad,
-                             input_end_y_pad - input_start_y_pad)).clone();
-            //infer
-            ncnn::Mat ncnn_out;
-            inference(input_tile, ncnn_out, input_end_x_pad - input_start_x_pad, input_end_y_pad - input_start_y_pad);
-            //to mat
-            cv::Mat out_tile = to_ocv(input_tile, ncnn_out);
+        ncnn::Mat in;
+        if (opt.use_fp16_storage && opt.use_int8_storage)
+        {
+            in = ncnn::Mat(w, (in_tile_y1 - in_tile_y0), (void*)(pixeldata + (size_t)in_tile_y0 * w * channels), (size_t)channels, 1);
+        }
+        else
+        {
+            in = ncnn::Mat::from_pixels(pixeldata + (size_t)in_tile_y0 * w * channels, ncnn::Mat::PIXEL_BGR, w, (in_tile_y1 - in_tile_y0));
+        }
 
-            int output_start_x = input_start_x * scale;
-            int output_end_x = input_end_x * scale;
-            int output_start_y = input_start_y * scale;
-            int output_end_y = input_end_y * scale;
+        ncnn::VkCompute cmd(net.vulkan_device());
 
-            int output_start_x_tile = (input_start_x - input_start_x_pad) * scale;
-            int output_end_x_tile = output_start_x_tile + input_tile_width * scale;
-            int output_start_y_tile = (input_start_y - input_start_y_pad) * scale;
-            int output_end_y_tile = output_start_y_tile + input_tile_height * scale;
-            cv::Rect tile_roi = cv::Rect(output_start_x_tile, output_start_y_tile,
-                                         output_end_x_tile - output_start_x_tile,
-                                         output_end_y_tile - output_start_y_tile);
-            cv::Rect out_roi = cv::Rect(output_start_x, output_start_y,
-                                        output_end_x - output_start_x, output_end_y - output_start_y);
-            out_tile(tile_roi).copyTo(out(out_roi));
+        ncnn::VkMat in_gpu;
+        {
+            cmd.record_clone(in, in_gpu, opt);
+
+            if (xtiles > 1)
+            {
+                cmd.submit_and_wait();
+                cmd.reset();
+            }
+        }
+
+        int out_tile_y0 = std::max(yi * TILE_SIZE_Y, 0);
+        int out_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y, h);
+
+        ncnn::VkMat out_gpu;
+        if (opt.use_fp16_storage && opt.use_int8_storage)
+        {
+            out_gpu.create(w * scale, (out_tile_y1 - out_tile_y0) * scale, (size_t)channels, 1, blob_vkallocator);
+        }
+        else
+        {
+            out_gpu.create(w * scale, (out_tile_y1 - out_tile_y0) * scale, channels, (size_t)4u, 1, blob_vkallocator);
+        }
+
+        for (int xi = 0; xi < xtiles; xi++)
+        {
+            // preproc: 타일 crop + BGR->RGB (GPU 셰이더 내부에서 처리)
+            ncnn::VkMat in_tile_gpu;
+            {
+                int tile_x0 = xi * TILE_SIZE_X - prepadding;
+                int tile_x1 = std::min((xi + 1) * TILE_SIZE_X, w) + prepadding;
+                int tile_y0 = yi * TILE_SIZE_Y - prepadding;
+                int tile_y1 = std::min((yi + 1) * TILE_SIZE_Y, h) + prepadding;
+
+                in_tile_gpu.create(tile_x1 - tile_x0, tile_y1 - tile_y0, 3, in_out_tile_elemsize, 1, blob_vkallocator);
+
+                ncnn::VkMat dummy_alpha; // 알파 채널 미지원 - 항상 빈 버퍼
+
+                std::vector<ncnn::VkMat> bindings(3);
+                bindings[0] = in_gpu;
+                bindings[1] = in_tile_gpu;
+                bindings[2] = dummy_alpha;
+
+                std::vector<ncnn::vk_constant_type> constants(13);
+                constants[0].i = in_gpu.w;
+                constants[1].i = in_gpu.h;
+                constants[2].i = in_gpu.cstep;
+                constants[3].i = in_tile_gpu.w;
+                constants[4].i = in_tile_gpu.h;
+                constants[5].i = in_tile_gpu.cstep;
+                constants[6].i = prepadding;
+                constants[7].i = prepadding;
+                constants[8].i = xi * TILE_SIZE_X;
+                constants[9].i = std::min(yi * TILE_SIZE_Y, prepadding);
+                constants[10].i = channels;
+                constants[11].i = 0;
+                constants[12].i = 0;
+
+                ncnn::VkMat dispatcher;
+                dispatcher.w = in_tile_gpu.w;
+                dispatcher.h = in_tile_gpu.h;
+                dispatcher.c = channels;
+
+                cmd.record_pipeline(realesrgan_preproc, bindings, constants, dispatcher);
+            }
+
+            // realesrgan 네트워크 추론
+            ncnn::VkMat out_tile_gpu;
+            {
+                ncnn::Extractor ex = net.create_extractor();
+
+                ex.set_blob_vkallocator(blob_vkallocator);
+                ex.set_workspace_vkallocator(blob_vkallocator);
+                ex.set_staging_vkallocator(staging_vkallocator);
+
+                ex.input("input", in_tile_gpu);
+                ex.extract("output", out_tile_gpu, cmd);
+            }
+
+            // postproc: 타일을 out_gpu의 제 위치에 합성 (GPU 셰이더 내부에서 RGB->BGR)
+            {
+                ncnn::VkMat dummy_alpha;
+
+                std::vector<ncnn::VkMat> bindings(3);
+                bindings[0] = out_tile_gpu;
+                bindings[1] = dummy_alpha;
+                bindings[2] = out_gpu;
+
+                std::vector<ncnn::vk_constant_type> constants(13);
+                constants[0].i = out_tile_gpu.w;
+                constants[1].i = out_tile_gpu.h;
+                constants[2].i = out_tile_gpu.cstep;
+                constants[3].i = out_gpu.w;
+                constants[4].i = out_gpu.h;
+                constants[5].i = out_gpu.cstep;
+                constants[6].i = xi * TILE_SIZE_X * scale;
+                constants[7].i = std::min(TILE_SIZE_X * scale, out_gpu.w - xi * TILE_SIZE_X * scale);
+                constants[8].i = prepadding * scale;
+                constants[9].i = prepadding * scale;
+                constants[10].i = channels;
+                constants[11].i = 0;
+                constants[12].i = 0;
+
+                ncnn::VkMat dispatcher;
+                dispatcher.w = std::min(TILE_SIZE_X * scale, out_gpu.w - xi * TILE_SIZE_X * scale);
+                dispatcher.h = out_gpu.h;
+                dispatcher.c = channels;
+
+                cmd.record_pipeline(realesrgan_postproc, bindings, constants, dispatcher);
+            }
+
+            if (xtiles > 1)
+            {
+                cmd.submit_and_wait();
+                cmd.reset();
+            }
+
+            fprintf(stderr, "background upscale %.2f%%\n", (float)(yi * xtiles + xi) / (ytiles * xtiles) * 100);
+        }
+
+        // 다운로드: out_gpu -> outimage의 해당 행 구간
+        {
+            unsigned char* out_row_ptr = outimage.data + (size_t)yi * scale * TILE_SIZE_Y * w * scale * channels;
+
+            ncnn::Mat out;
+            if (opt.use_fp16_storage && opt.use_int8_storage)
+            {
+                out = ncnn::Mat(out_gpu.w, out_gpu.h, (void*)out_row_ptr, (size_t)channels, 1);
+                cmd.record_clone(out_gpu, out, opt);
+                cmd.submit_and_wait();
+            }
+            else
+            {
+                cmd.record_clone(out_gpu, out, opt);
+                cmd.submit_and_wait();
+                out.to_pixels(out_row_ptr, ncnn::Mat::PIXEL_BGR);
+            }
         }
     }
 
-    out.copyTo(outimage);
-    return 0;
+    net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
+    net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
 
+    return 0;
 }
