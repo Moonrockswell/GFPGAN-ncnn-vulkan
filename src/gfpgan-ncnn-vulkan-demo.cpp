@@ -7,6 +7,8 @@
 #include <vector>
 #include <algorithm>
 #include <filesystem>
+#include <thread>
+#include <chrono>
 #include <net.h>
 #include "gfpgan.h"
 #include "face.h"
@@ -33,6 +35,8 @@
 // 있어 opencv_contrib 없이도 항상 사용 가능합니다 (xphoto와 달리 별도
 // 확인/매크로가 필요 없음).
 #include <opencv2/photo.hpp>
+// cv::setNumThreads() (-threads 옵션용)
+#include <opencv2/core.hpp>
 
 namespace fs = std::filesystem;
 
@@ -92,6 +96,12 @@ static void print_usage(const char *progname) {
         "                          RealESRGAN background upscale to the whole image; useful for\n"
         "                          anime/illustration/3D-render input where a real-face detector\n"
         "                          should not run or produces false positives\n"
+        "  -threads N              limit CPU threads used by OpenCV post-processing (denoise,\n"
+        "                          CLAHE, scratch-removal, etc, default = -1 = unlimited); does NOT\n"
+        "                          affect GPU (Vulkan) computation, only the CPU-side OpenCV steps\n"
+        "  -delay-ms N             wait N milliseconds after each image finishes when batch-\n"
+        "                          processing a folder (default = 0 = no delay); helps avoid\n"
+        "                          pinning the GPU at 100%% back-to-back with no breathing room\n"
         "\n"
         "The following options are applied to the background only (faces are always\n"
         "restored separately by GFPGAN), in this fixed pipeline order:\n"
@@ -648,6 +658,8 @@ int main(int argc, char **argv) {
     int vignetteStrength = 0;  // -vg, 0-100, default off, 비네팅(가장자리 어두워짐) 보정
     int scratchStrength = 0;  // -sr, 0-100, default off, 스크래치/먼지 제거(배경 전용, 인페인팅)
     int faceRestore = 1;  // -fr, 0=끔/1=켬(기본), 얼굴 검출 + GFPGAN 얼굴 복원 여부
+    int cpuThreads = -1;  // -threads, OpenCV 후처리(CPU)용 스레드 수 제한, 기본 -1(무제한)
+    int delayMs = 0;  // -delay-ms, 폴더 일괄 처리 시 이미지 한 장마다 대기(ms), 기본 0
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -699,6 +711,10 @@ int main(int argc, char **argv) {
             scratchStrength = std::atoi(argv[++i]);
         } else if (arg == "-fr" && i + 1 < argc) {
             faceRestore = std::atoi(argv[++i]);
+        } else if (arg == "-threads" && i + 1 < argc) {
+            cpuThreads = std::atoi(argv[++i]);
+        } else if (arg == "-delay-ms" && i + 1 < argc) {
+            delayMs = std::atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown or incomplete option: %s\n\n", arg.c_str());
             print_usage(argv[0]);
@@ -805,6 +821,23 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    if (faceRestore != 0 && faceRestore != 1) {
+        fprintf(stderr, "Error: -fr face-restore must be 0 (off) or 1 (on, default) (got '%d')\n\n", faceRestore);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (delayMs < 0) {
+        fprintf(stderr, "Error: -delay-ms must be 0 or a positive integer (got '%d')\n\n", delayMs);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    // -threads: OpenCV 후처리(CPU) 전용 스레드 수 제한. GPU(Vulkan) 연산에는 영향 없음.
+    // -1(기본)은 OpenCV가 시스템 기본값(보통 코어 수만큼)을 쓰도록 되돌리는 의미이며,
+    // 0은 OpenCV의 스레딩 최적화 자체를 끄는 의미(사실상 단일 스레드)입니다.
+    cv::setNumThreads(cpuThreads);
+
     if (!fs::exists(imagepath)) {
         fprintf(stderr, "Error: input path '%s' does not exist\n", imagepath.c_str());
         return -1;
@@ -891,6 +924,12 @@ int main(int argc, char **argv) {
                                    denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #endif
                 processed++;
+            }
+
+            // -delay-ms: 이미지 한 장이 끝날 때마다(성공/실패 무관) 대기.
+            // GPU가 쉬지 않고 연속 풀가동되는 것을 완화하기 위한 옵션.
+            if (delayMs > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
             }
         }
 
