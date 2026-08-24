@@ -60,7 +60,8 @@ static void print_usage(const char *progname) {
         "  -rm model-path     folder path to the RealESRGAN (background) models (default=%s)\n"
         "  -rn model-name    RealESRGAN model to use, file names kept exactly as officially\n"
         "                            distributed - default=realesrgan-x4plus\n"
-        "                            realesrgan-x4plus          general photos (default)\n"
+        "                            realesrgan-x2plus          general photos, native 2x (lighter GPU load)\n"
+        "                            realesrgan-x4plus          general photos, native 4x (default)\n"
         "                            realesrgan-x4plus-anime  anime / illustration art\n"
         "                            realesr-animevideov3      video frames (lightweight)\n"
         "  -f output format     output image format (jpg/png/webp, default=png)\n"
@@ -70,6 +71,8 @@ static void print_usage(const char *progname) {
         "  -s scale                 final output scale relative to original: 1/2/3/4 (default = 2)\n"
         "                            realesrgan-x4plus / -anime always run internally at their\n"
         "                            native 4x scale, then resize to whichever of 1/2/3/4 you pick;\n"
+        "                            realesrgan-x2plus runs internally at its native 2x scale, then\n"
+        "                            resizes the same way;\n"
         "                            realesr-animevideov3 loads a separate model per scale (2/3/4)\n"
         "                            and outputs it directly, no resize needed (1 falls back to a\n"
         "                            post-resize since there is no native 1x model)\n"
@@ -519,10 +522,10 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
         std::vector<cv::Mat> trans_img;
         std::vector<cv::Mat> trans_matrix_inv;
-        // real_esrgan.scale: realesrgan-x4plus 모델의 네이티브 배율(4).
-        // bg_upsample이 실제로 이 배율로 만들어지므로, 얼굴을 붙여넣을 좌표
-        // 변환도 반드시 같은 배율을 써야 얼굴이 배경 위 정확한 위치에
-        // 합성됩니다.
+        // real_esrgan.scale: 선택된 RealESRGAN 모델의 네이티브 배율
+        // (x2plus=2, x4plus/-anime=4, animevideov3=2/3/4). bg_upsample이
+        // 실제로 이 배율로 만들어지므로, 얼굴을 붙여넣을 좌표 변환도
+        // 반드시 같은 배율을 써야 얼굴이 배경 위 정확한 위치에 합성됩니다.
         face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img, real_esrgan.scale);
 
         for (size_t i = 0; i < objects.size(); i++) {
@@ -723,10 +726,11 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    if (realesrganModelName != "realesrgan-x4plus"
+    if (realesrganModelName != "realesrgan-x2plus"
+        && realesrganModelName != "realesrgan-x4plus"
         && realesrganModelName != "realesrgan-x4plus-anime"
         && realesrganModelName != "realesr-animevideov3") {
-        fprintf(stderr, "Error: -rn model-name must be one of realesrgan-x4plus, "
+        fprintf(stderr, "Error: -rn model-name must be one of realesrgan-x2plus, realesrgan-x4plus, "
                          "realesrgan-x4plus-anime, realesr-animevideov3 (got '%s')\n\n",
                 realesrganModelName.c_str());
         print_usage(argv[0]);
@@ -807,6 +811,9 @@ int main(int argc, char **argv) {
     // realesrgan-x4plus / realesrgan-x4plus-anime: 네트워크 구조 자체가 4배
     //   고정이라, 파일명에 배율이 붙지 않습니다. 최종 원하는 배율(-s)이
     //   4가 아니면 4배로 처리한 뒤 나중에 리사이즈합니다 (restore_one_image 참고).
+    // realesrgan-x2plus: 네트워크 구조 자체가 2배 고정입니다. x4plus 계열보다
+    //   타일당 GPU 부담이 가벼워 저사양/구형 GPU에 안전한 선택입니다. 최종
+    //   원하는 배율(-s)이 2가 아니면 2배로 처리한 뒤 나중에 리사이즈합니다.
     // realesr-animevideov3: 배율별로 별도 모델(-x2/-x3/-x4)이 나뉘어 있어서,
     //   원하는 최종 배율(-s)에 맞는 파일을 바로 불러오면 되고, 후처리
     //   리사이즈가 필요 없습니다.
@@ -820,6 +827,10 @@ int main(int argc, char **argv) {
         realesrganParam = realesrganModelDir + "/" + realesrganModelName + suffix + ".param";
         realesrganModel = realesrganModelDir + "/" + realesrganModelName + suffix + ".bin";
         real_esrgan.scale = modelScale;
+    } else if (realesrganModelName == "realesrgan-x2plus") {
+        realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
+        realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
+        real_esrgan.scale = 2;  // x2plus는 네트워크 구조상 2배 고정
     } else {
         realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
         realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
