@@ -211,11 +211,18 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(SHADER_SPV_HEX_FILES)
 compile_shader(realesrgan_preproc.comp)
 compile_shader(realesrgan_postproc.comp)
+# waifu2x cunet 노이즈 제거(-nn) 셰이더 (preproc/postproc) 컴파일
+compile_shader(waifu2x_preproc.comp)
+compile_shader(waifu2x_postproc.comp)
 add_custom_target(generate-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
 
-add_executable(gfpgan-ncnn-vulkan gfpgan-ncnn-vulkan-demo.cpp gfpgan.cpp face.cpp realesrgan.cpp)
+add_executable(gfpgan-ncnn-vulkan gfpgan-ncnn-vulkan-demo.cpp gfpgan.cpp face.cpp realesrgan.cpp waifu2x_denoise.cpp)
+
+# Waifu2xDenoise(-nn) 클래스 단독 검증용 테스트 도구 (GFPGAN/RealESRGAN 모델 불필요)
+add_executable(test_waifu2x_denoise test_waifu2x_denoise.cpp waifu2x_denoise.cpp)
 add_dependencies(gfpgan-ncnn-vulkan generate-spirv)
 target_link_libraries(gfpgan-ncnn-vulkan ${NCNN_GFPGAN_LINK_LIBRARIES} ${OpenCV_LIBS})
+target_link_libraries(test_waifu2x_denoise ${NCNN_GFPGAN_LINK_LIBRARIES} ${OpenCV_LIBS})
 
 if (HAVE_XPHOTO_HEADER)
     target_compile_definitions(gfpgan-ncnn-vulkan PRIVATE HAVE_XPHOTO=1)

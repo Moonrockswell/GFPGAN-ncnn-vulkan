@@ -13,6 +13,7 @@
 #include "gfpgan.h"
 #include "face.h"
 #include "realesrgan.h"
+#include "waifu2x_denoise.h"
 
 #define RESTORE_WHOLE_IMAGE 1   //0-only restore face, 1-restore whole image
 #define RESTORE_IMAGE_COLOR 0   //0-no color image, 1-coloring grayscale images
@@ -46,6 +47,10 @@ static const char *DEFAULT_MODEL_DIR = "./gfpgan-models";
 // RealESRGAN(배경 업스케일) 모델은 GFPGAN(얼굴 보정) 모델과 별도 폴더에 둡니다.
 // 공식 realesrgan-ncnn-vulkan 배포본의 모델 파일명을 변형 없이 그대로 사용합니다.
 static const char *DEFAULT_REALESRGAN_MODEL_DIR = "./realesrgan-models";
+// waifu2x cunet 노이즈 제거(-nn) 모델도 별도 폴더. 공식 waifu2x-ncnn-vulkan
+// models-cunet 배포본의 noise{1,2,3}_model.param/.bin 파일명을 그대로 사용
+// (scale 접미사 없는 버전 - 배율은 안 바꾸고 노이즈만 제거).
+static const char *DEFAULT_WAIFU2X_MODEL_DIR = "./waifu2x-models";
 
 static void print_usage(const char *progname) {
     fprintf(stderr,
@@ -96,6 +101,14 @@ static void print_usage(const char *progname) {
         "                          RealESRGAN background upscale to the whole image; useful for\n"
         "                          anime/illustration/3D-render input where a real-face detector\n"
         "                          should not run or produces false positives\n"
+        "  -nn ai-denoise-level    0=off (default), 1/2/3 - waifu2x cunet AI noise reduction,\n"
+        "                          applied to the ORIGINAL image before RealESRGAN upscale (so\n"
+        "                          the noise itself doesn't get magnified along with everything\n"
+        "                          else); this is a separate tool from -dn (algorithmic, background-\n"
+        "                          only, 0-100): -nn runs earlier, over the whole image (faces\n"
+        "                          included), and can be combined with -dn (e.g. -nn to remove\n"
+        "                          heavy noise first, -dn afterward for a light finishing touch)\n"
+        "  -wm model-path          folder path to the waifu2x (-nn) models (default=%s)\n"
         "  -threads N              limit CPU threads used by OpenCV post-processing (denoise,\n"
         "                          CLAHE, scratch-removal, etc, default = -1 = unlimited); does NOT\n"
         "                          affect GPU (Vulkan) computation, only the CPU-side OpenCV steps\n"
@@ -137,7 +150,7 @@ static void print_usage(const char *progname) {
         "                          boosts edge contrast for a crisper look; can produce haloing\n"
         "                          (double-edge outlines) at high strength - try -de instead or\n"
         "                          alongside it at a lower value; applied last, after -de\n",
-        progname, DEFAULT_MODEL_DIR, DEFAULT_REALESRGAN_MODEL_DIR);
+        progname, DEFAULT_MODEL_DIR, DEFAULT_REALESRGAN_MODEL_DIR, DEFAULT_WAIFU2X_MODEL_DIR);
 }
 
 static std::string to_lower(std::string s) {
@@ -300,8 +313,11 @@ static void paste_faces_to_input_image(const cv::Mat &restored_face, cv::Mat &tr
 // 차지하면 "회색 가정"이 깨져서 과보정(색이 부자연스럽게 틀어짐)될 수
 // 있습니다. 그래서 기본값은 꺼짐이며, 색이 눈에 띄게 편향된 사진에서만
 // 켜서 쓰는 것을 권장합니다.
+// backgroundMask: 이 값이 255인 픽셀에만 결과가 반영됩니다(그 외, 즉 얼굴
+// 영역은 원본 그대로 둠). 전역 색/밝기 보정이라 이미지 전체를 대상으로
+// 계산은 하되, 최종 반영은 배경 픽셀에만 copyTo로 제한합니다.
 #if HAVE_XPHOTO
-static void apply_white_balance(cv::Mat &img, int enabled) {
+static void apply_white_balance(cv::Mat &img, int enabled, const cv::Mat &backgroundMask) {
     if (enabled <= 0) return;
     cv::Ptr<cv::xphoto::GrayworldWB> wb = cv::xphoto::createGrayworldWB();
     // saturationThreshold: 이 값보다 채도가 높은 픽셀(피부, 원색 옷 등
@@ -310,13 +326,13 @@ static void apply_white_balance(cv::Mat &img, int enabled) {
     wb->setSaturationThreshold(0.95f);
     cv::Mat out;
     wb->balanceWhite(img, out);
-    img = out;
+    out.copyTo(img, backgroundMask);
 }
 #else
 // opencv_contrib(xphoto)가 빌드에 포함되지 않은 환경: 옵션은 받아들이되
 // 아무 효과도 적용하지 않는 no-op. (아래에서 -wb 값이 1이어도 조용히
 // 무시되며 별도 에러는 내지 않습니다.)
-static void apply_white_balance(cv::Mat &, int) {}
+static void apply_white_balance(cv::Mat &, int, const cv::Mat &) {}
 #endif
 
 // strength: 0(끔) ~ 100. 렌즈/스캔 특성상 사진 가장자리(특히 네 모서리)가
@@ -327,7 +343,7 @@ static void apply_white_balance(cv::Mat &, int) {}
 // 화이트밸런스와 같은 "전역 밝기/색 보정" 성격이라 그 바로 뒤, 디노이즈
 // 보다 앞서 적용합니다(먼저 밝기를 고르게 맞춘 뒤 잡티 제거 -> 대비 ->
 // 디테일 -> 샤프닝 순).
-static void apply_vignette_correction(cv::Mat &img, int strength) {
+static void apply_vignette_correction(cv::Mat &img, int strength, const cv::Mat &backgroundMask) {
     if (strength <= 0) return;
     if (strength > 100) strength = 100;
     // maxBoost: 모서리(중심에서 가장 먼 지점)에서 밝기를 최대 몇 배까지
@@ -364,7 +380,9 @@ static void apply_vignette_correction(cv::Mat &img, int strength) {
         ch32f = ch32f.mul(gain);
         ch32f.convertTo(ch, ch.type());  // 다시 원래 타입(8-bit)으로, 0~255는 자동 클리핑(saturate_cast)
     }
-    cv::merge(channels, img);
+    cv::Mat out;
+    cv::merge(channels, out);
+    out.copyTo(img, backgroundMask);
 }
 
 // strength: 0(끔) ~ 100. 오래된 인화지/필름 스캔에 흔한, 가늘고 긴 "선"
@@ -420,13 +438,13 @@ static void apply_scratch_removal(cv::Mat &img, int strength, const cv::Mat &bac
 
 // strength: 0(끔) ~ 100. cv::fastNlMeansDenoisingColored의 h(밝기)/hColor(색상)
 // 강도 파라미터로 매핑합니다 (대략 1~15 범위, OpenCV 권장 기본값이 h=3 부근).
-static void apply_denoise(cv::Mat &img, int strength) {
+static void apply_denoise(cv::Mat &img, int strength, const cv::Mat &backgroundMask) {
     if (strength <= 0) return;
     if (strength > 100) strength = 100;
     float h = 1.0f + (strength / 100.0f) * 14.0f;
     cv::Mat out;
     cv::fastNlMeansDenoisingColored(img, out, h, h, 7, 21);
-    img = out;
+    out.copyTo(img, backgroundMask);
 }
 
 // strength: 0(끔) ~ 100. CLAHE(Contrast Limited Adaptive Histogram Equalization)로
@@ -434,7 +452,7 @@ static void apply_denoise(cv::Mat &img, int strength) {
 // 색이 틀어지므로, Lab 색공간의 밝기(L) 채널에만 적용하고 색상(a/b) 채널은
 // 그대로 둡니다. clipLimit이 클수록 대비 향상이 강해지지만 노이즈도 같이
 // 증폭될 수 있어 1.0~4.0 범위로 제한합니다. 타일 크기는 8x8 고정(표준값).
-static void apply_clahe(cv::Mat &img, int strength) {
+static void apply_clahe(cv::Mat &img, int strength, const cv::Mat &backgroundMask) {
     if (strength <= 0) return;
     if (strength > 100) strength = 100;
     double clipLimit = 1.0 + (strength / 100.0) * 3.0;
@@ -448,12 +466,14 @@ static void apply_clahe(cv::Mat &img, int strength) {
     clahe->apply(channels[0], channels[0]);
 
     cv::merge(channels, lab);
-    cv::cvtColor(lab, img, cv::COLOR_Lab2BGR);
+    cv::Mat out;
+    cv::cvtColor(lab, out, cv::COLOR_Lab2BGR);
+    out.copyTo(img, backgroundMask);
 }
 
 // strength: 0(끔) ~ 100. 가우시안 블러 버전과의 차이를 더해주는 언샵 마스크 방식.
 // amount가 클수록 윤곽선 대비가 강해집니다 (대략 0~2.0x 범위로 매핑).
-static void apply_sharpen(cv::Mat &img, int strength) {
+static void apply_sharpen(cv::Mat &img, int strength, const cv::Mat &backgroundMask) {
     if (strength <= 0) return;
     if (strength > 100) strength = 100;
     double amount = (strength / 100.0) * 2.0;
@@ -461,7 +481,7 @@ static void apply_sharpen(cv::Mat &img, int strength) {
     cv::GaussianBlur(img, blurred, cv::Size(0, 0), 3.0);
     cv::Mat sharpened;
     cv::addWeighted(img, 1.0 + amount, blurred, -amount, 0, sharpened);
-    img = sharpened;
+    sharpened.copyTo(img, backgroundMask);
 }
 
 // strength: 0(끔) ~ 100. cv::detailEnhance()를 이용한 디테일 향상.
@@ -476,7 +496,7 @@ static void apply_sharpen(cv::Mat &img, int strength) {
 // 띄고 자연스러운 "화질이 좋아진" 느낌을 줍니다.
 // -sp와 별도 옵션이며, 둘 다 켜도 되고(디테일 향상 후 마지막에 약한
 // 샤프닝만 살짝 얹는 조합도 가능) -sp 대신 이것만 켜도 됩니다.
-static void apply_detail_enhance(cv::Mat &img, int strength) {
+static void apply_detail_enhance(cv::Mat &img, int strength, const cv::Mat &backgroundMask) {
     if (strength <= 0) return;
     if (strength > 100) strength = 100;
     // sigma_s(공간 표준편차, 필터가 참고하는 주변 반경): 클수록 더 넓은
@@ -488,7 +508,7 @@ static void apply_detail_enhance(cv::Mat &img, int strength) {
     float sigma_r = 0.15f + (strength / 100.0f) * 0.25f;
     cv::Mat out;
     cv::detailEnhance(img, out, sigma_s, sigma_r);
-    img = out;
+    out.copyTo(img, backgroundMask);
 }
 
 // Runs the full restoration pipeline on a single image and writes the result.
@@ -497,6 +517,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
 #if RESTORE_WHOLE_IMAGE
                                Face &face_detector, RealESRGAN &real_esrgan,
 #endif
+                               Waifu2xDenoise *waifu2x_denoise,
                                const std::string &inputPath, const std::string &outputPath,
                                int denoiseStrength, int sharpenStrength, int claheStrength, int scale,
                                size_t maxFacesPerImage, int whiteBalance, int detailEnhanceStrength,
@@ -505,6 +526,16 @@ static bool restore_one_image(GFPGAN &gfpgan,
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
         return false;
+    }
+
+    // -nn(AI 노이즈 제거): 파이프라인의 가장 앞단, RealESRGAN 업스케일보다도
+    // 먼저 원본 이미지에 적용합니다. 노이즈가 있는 채로 업스케일하면 노이즈
+    // 자체도 같이 확대되므로, 순서상 업스케일 이전이 이론적으로 맞습니다.
+    // waifu2x_denoise가 nullptr이면(-nn 0, 기본값) 완전히 건너뜁니다.
+    if (waifu2x_denoise != nullptr) {
+        cv::Mat denoised;
+        waifu2x_denoise->tile_process(img, denoised);
+        img = denoised;
     }
 
     // Wrap the whole restoration pipeline so that an unexpected OpenCV/ncnn
@@ -596,13 +627,13 @@ static bool restore_one_image(GFPGAN &gfpgan,
     // 순서: 화이트밸런스(색 편향 보정) -> 비네팅 보정(가장자리 밝기 보정)
     //       -> 스크래치 제거(배경 전용) -> 디노이즈(잡티 제거) -> CLAHE(대비 향상)
     //       -> 디테일 향상(자연스러운 텍스처 보강) -> 샤프닝(마지막 선명도 마무리)
-    apply_white_balance(bg_upsample, whiteBalance);
-    apply_vignette_correction(bg_upsample, vignetteStrength);
+    apply_white_balance(bg_upsample, whiteBalance, backgroundMask);
+    apply_vignette_correction(bg_upsample, vignetteStrength, backgroundMask);
     apply_scratch_removal(bg_upsample, scratchStrength, backgroundMask);
-    apply_denoise(bg_upsample, denoiseStrength);
-    apply_clahe(bg_upsample, claheStrength);
-    apply_detail_enhance(bg_upsample, detailEnhanceStrength);
-    apply_sharpen(bg_upsample, sharpenStrength);
+    apply_denoise(bg_upsample, denoiseStrength, backgroundMask);
+    apply_clahe(bg_upsample, claheStrength, backgroundMask);
+    apply_detail_enhance(bg_upsample, detailEnhanceStrength, backgroundMask);
+    apply_sharpen(bg_upsample, sharpenStrength, backgroundMask);
 
     cv::imwrite(outputPath, bg_upsample);
 #else
@@ -616,13 +647,13 @@ static bool restore_one_image(GFPGAN &gfpgan,
     // 없으므로, 이미지 전체를 "배경"으로 간주해 스크래치 제거를 적용합니다.
     cv::Mat fullMask = cv::Mat::ones(restored_face.size(), CV_8UC1) * 255;
 
-    apply_white_balance(restored_face, whiteBalance);
-    apply_vignette_correction(restored_face, vignetteStrength);
+    apply_white_balance(restored_face, whiteBalance, fullMask);
+    apply_vignette_correction(restored_face, vignetteStrength, fullMask);
     apply_scratch_removal(restored_face, scratchStrength, fullMask);
-    apply_denoise(restored_face, denoiseStrength);
-    apply_clahe(restored_face, claheStrength);
-    apply_detail_enhance(restored_face, detailEnhanceStrength);
-    apply_sharpen(restored_face, sharpenStrength);
+    apply_denoise(restored_face, denoiseStrength, fullMask);
+    apply_clahe(restored_face, claheStrength, fullMask);
+    apply_detail_enhance(restored_face, detailEnhanceStrength, fullMask);
+    apply_sharpen(restored_face, sharpenStrength, fullMask);
 
     cv::imwrite(outputPath, restored_face);
 #endif
@@ -658,6 +689,8 @@ int main(int argc, char **argv) {
     int vignetteStrength = 0;  // -vg, 0-100, default off, 비네팅(가장자리 어두워짐) 보정
     int scratchStrength = 0;  // -sr, 0-100, default off, 스크래치/먼지 제거(배경 전용, 인페인팅)
     int faceRestore = 1;  // -fr, 0=끔/1=켬(기본), 얼굴 검출 + GFPGAN 얼굴 복원 여부
+    int aiDenoiseLevel = 0;  // -nn, 0=off(기본)/1/2/3, waifu2x cunet AI 노이즈 제거
+    std::string waifu2xModelDir = DEFAULT_WAIFU2X_MODEL_DIR;  // -wm
     int cpuThreads = -1;  // -threads, OpenCV 후처리(CPU)용 스레드 수 제한, 기본 -1(무제한)
     int delayMs = 0;  // -delay-ms, 폴더 일괄 처리 시 이미지 한 장마다 대기(ms), 기본 0
 
@@ -711,6 +744,10 @@ int main(int argc, char **argv) {
             scratchStrength = std::atoi(argv[++i]);
         } else if (arg == "-fr" && i + 1 < argc) {
             faceRestore = std::atoi(argv[++i]);
+        } else if (arg == "-nn" && i + 1 < argc) {
+            aiDenoiseLevel = std::atoi(argv[++i]);
+        } else if (arg == "-wm" && i + 1 < argc) {
+            waifu2xModelDir = argv[++i];
         } else if (arg == "-threads" && i + 1 < argc) {
             cpuThreads = std::atoi(argv[++i]);
         } else if (arg == "-delay-ms" && i + 1 < argc) {
@@ -827,6 +864,12 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    if (aiDenoiseLevel < 0 || aiDenoiseLevel > 3) {
+        fprintf(stderr, "Error: -nn ai-denoise-level must be 0 (off, default), 1, 2, or 3 (got '%d')\n\n", aiDenoiseLevel);
+        print_usage(argv[0]);
+        return -1;
+    }
+
     if (delayMs < 0) {
         fprintf(stderr, "Error: -delay-ms must be 0 or a positive integer (got '%d')\n\n", delayMs);
         print_usage(argv[0]);
@@ -893,6 +936,26 @@ int main(int argc, char **argv) {
     real_esrgan.tile_size = tilesize;   // -t 로 넘긴 값 적용 (기본 400)
 #endif
 
+    // -nn(AI 노이즈 제거): 0(기본, 꺼짐)이면 Waifu2xDenoise를 아예 만들지
+    // 않고 nullptr로 둬서, GPU 로드/VRAM 낭비 없이 완전히 건너뜁니다.
+    // RESTORE_WHOLE_IMAGE 매크로와 무관하게(두 빌드 경로 모두) 동작합니다.
+    Waifu2xDenoise *waifu2x_denoise = nullptr;
+    if (aiDenoiseLevel > 0) {
+        waifu2x_denoise = new Waifu2xDenoise();
+        // 공식 waifu2x-ncnn-vulkan models-cunet 배포본과 동일한 파일명
+        // (noise1_model.param/.bin ~ noise3_model.param/.bin, scale 접미사
+        // 없는 버전 - 배율은 안 바꾸고 노이즈만 제거).
+        std::string noiseParam = waifu2xModelDir + "/noise" + std::to_string(aiDenoiseLevel) + "_model.param";
+        std::string noiseModel = waifu2xModelDir + "/noise" + std::to_string(aiDenoiseLevel) + "_model.bin";
+        if (waifu2x_denoise->load(noiseParam, noiseModel) < 0) {
+            fprintf(stderr, "Error: failed to load waifu2x -nn model from '%s' (-wm to change the folder)\n\n", waifu2xModelDir.c_str());
+            return -1;
+        }
+        // RealESRGAN과 같은 -t 값을 공유(간단하게 시작; 문제가 생기면 나중에
+        // -nn 전용 타일 크기 옵션으로 분리 가능).
+        waifu2x_denoise->tile_size = tilesize;
+    }
+
     bool inputIsDir = fs::is_directory(imagepath);
 
     if (inputIsDir) {
@@ -917,10 +980,10 @@ int main(int argc, char **argv) {
 
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
-            if (restore_one_image(gfpgan, face_detector, real_esrgan, entry.path().string(), outPath,
+            if (restore_one_image(gfpgan, face_detector, real_esrgan, waifu2x_denoise, entry.path().string(), outPath,
                                    denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #else
-            if (restore_one_image(gfpgan, entry.path().string(), outPath,
+            if (restore_one_image(gfpgan, waifu2x_denoise, entry.path().string(), outPath,
                                    denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #endif
                 processed++;
@@ -948,10 +1011,10 @@ int main(int argc, char **argv) {
         }
 
 #if RESTORE_WHOLE_IMAGE
-        if (!restore_one_image(gfpgan, face_detector, real_esrgan, imagepath, outPath,
+        if (!restore_one_image(gfpgan, face_detector, real_esrgan, waifu2x_denoise, imagepath, outPath,
                                 denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #else
-        if (!restore_one_image(gfpgan, imagepath, outPath,
+        if (!restore_one_image(gfpgan, waifu2x_denoise, imagepath, outPath,
                                 denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #endif
             return -1;
