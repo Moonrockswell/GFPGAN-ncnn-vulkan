@@ -126,7 +126,7 @@ static void print_usage(const char *progname) {
     fprintf(stderr, "      " C_GREEN "realesr-animevideov3" C_RESET "    video frames (lightweight)\n");
     fprintf(stderr, "  " C_WHITE "-f" C_RESET " output format        output image format (jpg/png/webp, "
         C_GREEN "default=png" C_RESET ")\n");
-    fprintf(stderr, "  " C_WHITE "-t" C_RESET " tile-size            background upscale tile-size, must be > 0 "
+    fprintf(stderr, "  " C_WHITE "-t" C_RESET " tile-size            background upscale tile-size, 0=no tiling "
         C_GREEN "(default = 300)" C_RESET "\n");
     fprintf(stderr, C_GRAY
         "                          smaller values reduce GPU memory load per step\n"
@@ -856,8 +856,8 @@ int main(int argc, char **argv) {
         return -1;
     }
 
-    if (tilesize <= 0) {
-        fprintf(stderr, "Error: -t tile-size must be a positive integer (got '%d')\n\n", tilesize);
+    if (tilesize < 0) {
+        fprintf(stderr, "Error: -t tile-size must be 0 (no tiling) or a positive integer (got '%d')\n\n", tilesize);
         print_usage(argv[0]);
         return -1;
     }

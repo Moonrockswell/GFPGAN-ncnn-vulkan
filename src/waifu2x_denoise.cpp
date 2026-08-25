@@ -133,8 +133,9 @@ int Waifu2xDenoise::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
         pixeldata = inimage_cont.data;
     }
 
-    const int TILE_SIZE_X = tile_size;
-    const int TILE_SIZE_Y = tile_size;
+    // tile_size <= 0 은 "타일 안 씀(이미지 전체를 타일 1개로 처리)"을 의미합니다.
+    const int TILE_SIZE_X = tile_size > 0 ? tile_size : w;
+    const int TILE_SIZE_Y = tile_size > 0 ? tile_size : h;
     const int pad = prepadding;
 
     ncnn::VkAllocator* blob_vkallocator = net.vulkan_device()->acquire_blob_allocator();
