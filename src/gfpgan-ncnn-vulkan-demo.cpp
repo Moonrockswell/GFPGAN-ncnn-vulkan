@@ -15,6 +15,10 @@
 #include "realesrgan.h"
 #include "waifu2x_denoise.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #define RESTORE_WHOLE_IMAGE 1   //0-only restore face, 1-restore whole image
 #define RESTORE_IMAGE_COLOR 0   //0-no color image, 1-coloring grayscale images
 
@@ -52,105 +56,184 @@ static const char *DEFAULT_REALESRGAN_MODEL_DIR = "./realesrgan-models";
 // (scale 접미사 없는 버전 - 배율은 안 바꾸고 노이즈만 제거).
 static const char *DEFAULT_WAIFU2X_MODEL_DIR = "./waifu2x-models";
 
+// ---------- ANSI 컬러 (gfpgan-auto-composite.bat 와 동일 팔레트) ----------
+// -h 출력에 색을 입히기 위한 매크로들입니다. 실제로 터미널에 반영되려면
+// Windows 콘솔에서 VT100 이스케이프 처리를 켜줘야 하므로, 아래
+// enable_ansi_colors()를 main() 맨 앞에서 한 번 호출합니다(파이프로 리다이렉트
+// 되거나 콘솔이 아닌 경우에도 SetConsoleMode 호출 자체는 안전하게 무시됩니다).
+#define C_CYAN   "\x1b[96m"
+#define C_YELLOW "\x1b[93m"
+#define C_GRAY   "\x1b[90m"
+#define C_WHITE  "\x1b[97m"
+#define C_GREEN  "\x1b[92m"
+#define C_RESET  "\x1b[0m"
+
+static void enable_ansi_colors() {
+#ifdef _WIN32
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return;
+    DWORD mode = 0;
+    if (!GetConsoleMode(hOut, &mode)) return;
+    SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+    // -h 도움말은 stderr로 나가므로 stderr 핸들도 같이 켜줍니다.
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if (hErr != INVALID_HANDLE_VALUE && GetConsoleMode(hErr, &mode)) {
+        SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+#endif
+}
+
 static void print_usage(const char *progname) {
-    fprintf(stderr,
-        "Usage: %s -i infile -o outfile [options]\n"
-        "\n"
-        "  -h                      show this help\n"
-        "  -i input-path           input image path (jpg/png/webp) or folder\n"
-        "  -o output-path          output image path (jpg/png/webp) or folder\n"
+    fprintf(stderr, C_CYAN "===========================================================\n" C_RESET);
+    fprintf(stderr, "  " C_CYAN "GFPGAN Auto Composite" C_RESET "\n");
+    fprintf(stderr, "  " C_GRAY "Face restore (GFPGAN) + background upscale (RealESRGAN)\n" C_RESET);
+    fprintf(stderr, C_CYAN "===========================================================\n" C_RESET);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  " C_WHITE "Usage:" C_RESET " %s -i infile -o outfile [options]\n\n", progname);
+
+    // ---------------- I/O ----------------
+    fprintf(stderr, C_CYAN "  [ I/O ]" C_RESET "\n");
+    fprintf(stderr, "  " C_WHITE "-h" C_RESET "                      show this help\n");
+    fprintf(stderr, "  " C_WHITE "-i" C_RESET " input-path           input image path (jpg/png/webp) or folder\n");
+    fprintf(stderr, "  " C_WHITE "-o" C_RESET " output-path          output image path (jpg/png/webp) or folder\n");
+    fprintf(stderr, C_GRAY
         "                          If -o is omitted\n"
         "                          1) single file input - saved next to the input as <name>-output.<ext>\n"
         "                          2) saved into a new '<foldername>-output' subfolder\n"
         "                             inside the input folder, original files kept\n"
-        "                          3) . is recognized as the current folder\n"
-        "\n"
-        "  -m model-path           folder path to the GFPGAN (face) models (default=%s)\n"
-        "  -rm model-path          folder path to the RealESRGAN (background) models (default=%s)\n"
-        "  -n model name           GFPGANCleanv1-NoCE-C2 supports only one type of model\n"
-        "                          (fixed, cannot be changed)\n"
-        "  -rn model-name          RealESRGAN model to use, file names kept exactly as officially\n"
-        "                          distributed. If -rn is not given explicitly, it is auto-picked\n"
-        "                          based on -s: -s 1/2 -> realesrgan-x2plus, -s 3/4 -> realesrgan-x4plus\n"
+        "                          3) . is recognized as the current folder\n" C_RESET);
+    fprintf(stderr, "\n");
+
+    // ---------------- MODELS / FORMAT / TILE ----------------
+    fprintf(stderr, C_CYAN "  [ MODELS / OUTPUT ]" C_RESET "\n");
+    fprintf(stderr, "  " C_WHITE "-m" C_RESET " model-path           folder path to the GFPGAN (face) models "
+        C_GRAY "(default=%s)" C_RESET "\n", DEFAULT_MODEL_DIR);
+    fprintf(stderr, "  " C_WHITE "-rm" C_RESET " model-path          folder path to the RealESRGAN (background) models "
+        C_GRAY "(default=%s)" C_RESET "\n", DEFAULT_REALESRGAN_MODEL_DIR);
+    fprintf(stderr, "  " C_WHITE "-n" C_RESET " model name           GFPGANCleanv1-NoCE-C2 supports only one type of model "
+        C_GRAY "(fixed)" C_RESET "\n");
+    fprintf(stderr, "  " C_WHITE "-rn" C_RESET " model-name          RealESRGAN model to use; auto-picked from " C_WHITE "-s" C_RESET " if omitted:\n");
+    fprintf(stderr, C_GRAY
+        "                          -s 1/2 -> realesrgan-x2plus, -s 3/4 -> realesrgan-x4plus\n"
         "                          (picks whichever model's native scale is closest, avoiding both\n"
-        "                          wasted GPU work and excessive upscaling)\n"
-        "                            realesrgan-x2plus       general photos, native 2x -\n"
-        "                                                    about half the GPU work of x4plus,\n"
-        "                                                    the auto default for -s 1/2\n"
-        "                            realesrgan-x4plus       general photos, native 4x - sharper/\n"
-        "                                                    more detail than x2plus, but roughly\n"
-        "                                                    double the GPU work; the auto default\n"
-        "                                                    for -s 3/4\n"
-        "                            realesrgan-x4plus-anime anime / illustration art\n"
-        "                            realesr-animevideov3    video frames (lightweight)\n"
-        "  -f output format        output image format (jpg/png/webp, default=png)\n"
-        "  -t tile-size            background upscale tile-size, must be > 0 (default = 300)\n"
+        "                          wasted GPU work and excessive upscaling)\n" C_RESET);
+    fprintf(stderr, "      " C_GREEN "realesrgan-x2plus" C_RESET "       general photos, native 2x - about half\n");
+    fprintf(stderr, C_GRAY "                          the GPU work of x4plus; auto default for -s 1/2\n" C_RESET);
+    fprintf(stderr, "      " C_GREEN "realesrgan-x4plus" C_RESET "       general photos, native 4x - sharper/more\n");
+    fprintf(stderr, C_GRAY "                          detail, roughly double the GPU work; auto default for -s 3/4\n" C_RESET);
+    fprintf(stderr, "      " C_GREEN "realesrgan-x4plus-anime" C_RESET " anime / illustration art\n");
+    fprintf(stderr, "      " C_GREEN "realesr-animevideov3" C_RESET "    video frames (lightweight)\n");
+    fprintf(stderr, "  " C_WHITE "-f" C_RESET " output format        output image format (jpg/png/webp, "
+        C_GREEN "default=png" C_RESET ")\n");
+    fprintf(stderr, "  " C_WHITE "-t" C_RESET " tile-size            background upscale tile-size, must be > 0 "
+        C_GREEN "(default = 300)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
         "                          smaller values reduce GPU memory load per step\n"
-        "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n"
-        "  -s scale                final output scale relative to original: 1/2/3/4 (default = 2)\n"
+        "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-s" C_RESET " scale                final output scale relative to original: 1/2/3/4 "
+        C_GREEN "(default = 2)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
         "                          realesrgan-x4plus / -anime always run internally at their\n"
         "                          native 4x scale, then resize to whichever of 1/2/3/4 you pick;\n"
         "                          realesr-animevideov3 loads a separate model per scale (2/3/4)\n"
         "                          and outputs it directly, no resize needed (1 falls back to a\n"
-        "                          post-resize since there is no native 1x model)\n"
-        "  -mf max-faces           max face candidates processed per image, 1-20 (default = 5)\n"
-        "                          raise this if legitimate photos have more than 5 faces;\n"
-        "                          excess candidates beyond this cap are dropped by confidence score\n"
-        "  -fr face-restore        0=off, 1=on (default) - face detection + GFPGAN face restoration\n"
+        "                          post-resize since there is no native 1x model)\n" C_RESET);
+    fprintf(stderr, "\n");
+
+    // ---------------- NEURAL PASSES ----------------
+    fprintf(stderr, C_CYAN "  [ NEURAL PASSES ]" C_RESET C_GRAY "  GPU (Vulkan) - runs on the full frame, faces\n"
+        "  included, before the background pipeline below\n" C_RESET);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  " C_WHITE "-fr" C_RESET " face-restore        0=off, 1=on "
+        C_GREEN "(default)" C_RESET " - face detection + GFPGAN face restoration\n");
+    fprintf(stderr, C_GRAY
         "                          0 skips face detection/GFPGAN entirely and applies only the\n"
         "                          RealESRGAN background upscale to the whole image; useful for\n"
         "                          anime/illustration/3D-render input where a real-face detector\n"
-        "                          should not run or produces false positives\n"
-        "  -nn ai-denoise-level    0=off (default), 1/2/3 - waifu2x cunet AI noise reduction,\n"
+        "                          should not run or produces false positives\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-mf" C_RESET " max-faces           max face candidates processed per image, 1-20 "
+        C_GREEN "(default = 5)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
+        "                          raise this if legitimate photos have more than 5 faces;\n"
+        "                          excess candidates beyond this cap are dropped by confidence score\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-nn" C_RESET " ai-denoise-level    0=off "
+        C_GREEN "(default)" C_RESET ", 1/2/3 - waifu2x cunet AI noise reduction\n");
+    fprintf(stderr, C_GRAY
         "                          applied to the ORIGINAL image before RealESRGAN upscale (so\n"
         "                          the noise itself doesn't get magnified along with everything\n"
         "                          else); this is a separate tool from -dn (algorithmic, background-\n"
         "                          only, 0-100): -nn runs earlier, over the whole image (faces\n"
         "                          included), and can be combined with -dn (e.g. -nn to remove\n"
-        "                          heavy noise first, -dn afterward for a light finishing touch)\n"
-        "  -wm model-path          folder path to the waifu2x (-nn) models (default=%s)\n"
-        "  -threads N              limit CPU threads used by OpenCV post-processing (denoise,\n"
-        "                          CLAHE, scratch-removal, etc, default = -1 = unlimited); does NOT\n"
-        "                          affect GPU (Vulkan) computation, only the CPU-side OpenCV steps\n"
-        "  -delay-ms N             wait N milliseconds after each image finishes when batch-\n"
-        "                          processing a folder (default = 0 = no delay); helps avoid\n"
-        "                          pinning the GPU at 100%% back-to-back with no breathing room\n"
-        "\n"
-        "The following options are applied to the background only (faces are always\n"
-        "restored separately by GFPGAN), in this fixed pipeline order:\n"
-        "  white-balance -> vignette-correct -> scratch-removal -> denoise -> clahe ->\n"
-        "  detail-enhance -> sharpen\n"
-        "\n"
-        "  -wb white-balance       0=off (default), 1=on - auto white balance (Gray-World)\n"
+        "                          heavy noise first, -dn afterward for a light finishing touch)\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-wm" C_RESET " model-path          folder path to the waifu2x (-nn) models "
+        C_GRAY "(default=%s)" C_RESET "\n", DEFAULT_WAIFU2X_MODEL_DIR);
+    fprintf(stderr, "\n");
+
+    // ---------------- BACKGROUND PIPELINE ----------------
+    fprintf(stderr, C_CYAN "  [ BACKGROUND PIPELINE ]" C_RESET C_GRAY "  applied to background only, faces are\n"
+        "  always restored separately by GFPGAN, in this fixed order:\n" C_RESET);
+    fprintf(stderr, "  " C_GRAY "white-balance -> vignette-correct -> scratch-removal -> denoise -> clahe ->\n"
+        "  detail-enhance -> sharpen\n" C_RESET);
+    fprintf(stderr, "\n");
+
+    fprintf(stderr, "  " C_WHITE "-wb" C_RESET " white-balance       0=off "
+        C_GREEN "(default)" C_RESET ", 1=on - auto white balance (Gray-World)\n");
+    fprintf(stderr, C_GRAY
         "                          corrects color casts (fluorescent green/yellow tint, tungsten\n"
         "                          orange tint, shade blue tint); applied first, before every\n"
         "                          other effect below\n"
-        "                          (requires opencv_contrib's xphoto module; no-op if not built with it)\n"
-        "  -vg vignette-correct    0-100, default = 0 (off) - corrects dark corners/edges (vignetting)\n"
+        "                          (requires opencv_contrib's xphoto module; no-op if not built with it)\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-vg" C_RESET " vignette-correct    0-100, "
+        C_GREEN "default = 0 (off)" C_RESET " - corrects dark corners/edges (vignetting)\n");
+    fprintf(stderr, C_GRAY
         "                          brightens the image radially (more toward the corners, none at\n"
         "                          the center); an approximate correction, not a lens-specific one;\n"
-        "                          applied right after -wb, before -sr\n"
-        "  -sr scratch-removal     0-100, default = 0 (off) - removes thin scratches/dust specks\n"
+        "                          applied right after -wb, before -sr\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-sr" C_RESET " scratch-removal     0-100, "
+        C_GREEN "default = 0 (off)" C_RESET " - removes thin scratches/dust specks\n");
+    fprintf(stderr, C_GRAY
         "                          typical of old print/film scans, via inpainting; background\n"
         "                          only (face areas are always left untouched); applied right\n"
-        "                          after -vg, before -dn\n"
-        "  -dn denoise             0-100, default = 0 (off) - reduces background grain/noise\n"
+        "                          after -vg, before -dn\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-dn" C_RESET " denoise             0-100, "
+        C_GREEN "default = 0 (off)" C_RESET " - reduces background grain/noise\n");
+    fprintf(stderr, C_GRAY
         "                          (e.g. sensor noise, JPEG blockiness, scan grain); higher values\n"
         "                          smooth more but can start to soften fine detail; applied right\n"
-        "                          after -sr, before -cl\n"
-        "  -cl clahe               0-100, default = 0 (off) - CLAHE local contrast enhancement\n"
+        "                          after -sr, before -cl\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-cl" C_RESET " clahe               0-100, "
+        C_GREEN "default = 0 (off)" C_RESET " - CLAHE local contrast enhancement\n");
+    fprintf(stderr, C_GRAY
         "                          (Contrast Limited Adaptive Histogram Equalization); brings out\n"
         "                          local detail in flat/washed-out areas without blowing out\n"
-        "                          highlights elsewhere; applied right after -dn, before -de\n"
-        "  -de detail-enhance      0-100, default = 0 (off) - edge-preserving detail enhancement\n"
+        "                          highlights elsewhere; applied right after -dn, before -de\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-de" C_RESET " detail-enhance      0-100, "
+        C_GREEN "default = 0 (off)" C_RESET " - edge-preserving detail enhancement\n");
+    fprintf(stderr, C_GRAY
         "                          more natural alternative/addition to -sp: enhances fine texture\n"
         "                          while preserving major edges, so it avoids the haloing that -sp\n"
-        "                          can produce at high strength; applied after -cl, before -sp\n"
-        "  -sp sharpen             0-100, default = 0 (off) - unsharp-mask style sharpening\n"
+        "                          can produce at high strength; applied after -cl, before -sp\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-sp" C_RESET " sharpen             0-100, "
+        C_GREEN "default = 0 (off)" C_RESET " - unsharp-mask style sharpening\n");
+    fprintf(stderr, C_GRAY
         "                          boosts edge contrast for a crisper look; can produce haloing\n"
         "                          (double-edge outlines) at high strength - try -de instead or\n"
-        "                          alongside it at a lower value; applied last, after -de\n",
-        progname, DEFAULT_MODEL_DIR, DEFAULT_REALESRGAN_MODEL_DIR, DEFAULT_WAIFU2X_MODEL_DIR);
+        "                          alongside it at a lower value; applied last, after -de\n" C_RESET);
+    fprintf(stderr, "\n");
+
+    // ---------------- PERFORMANCE ----------------
+    fprintf(stderr, C_CYAN "  [ PERFORMANCE ]" C_RESET "\n");
+    fprintf(stderr, "  " C_WHITE "-threads" C_RESET " N              limit CPU threads used by OpenCV post-processing (denoise,\n");
+    fprintf(stderr, C_GRAY
+        "                          CLAHE, scratch-removal, etc, default = -1 = unlimited); does NOT\n"
+        "                          affect GPU (Vulkan) computation, only the CPU-side OpenCV steps\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-delay-ms" C_RESET " N             wait N milliseconds after each image finishes when batch-\n");
+    fprintf(stderr, C_GRAY
+        "                          processing a folder (default = 0 = no delay); helps avoid\n"
+        "                          pinning the GPU at 100%% back-to-back with no breathing room\n" C_RESET);
+    fprintf(stderr, "\n");
+    fprintf(stderr, C_GRAY "-----------------------------------------------------------\n" C_RESET);
 }
 
 static std::string to_lower(std::string s) {
@@ -670,6 +753,8 @@ static bool restore_one_image(GFPGAN &gfpgan,
 }
 
 int main(int argc, char **argv) {
+    enable_ansi_colors();  // Windows 콘솔에서 -h 출력 색상이 보이도록 VT100 처리를 켠다
+
     std::string imagepath;
     std::string outputpath;
     std::string modeldir = DEFAULT_MODEL_DIR;
