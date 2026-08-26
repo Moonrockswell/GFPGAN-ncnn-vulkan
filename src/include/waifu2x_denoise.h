@@ -28,7 +28,7 @@
 class Waifu2xDenoise
 {
 public:
-    Waifu2xDenoise(int gpuid = 0);
+    Waifu2xDenoise(int gpuid = 0, bool force_fp32 = false);
     ~Waifu2xDenoise();
 
     int load(const std::string& parampath, const std::string& modelpath);

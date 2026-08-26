@@ -24,7 +24,7 @@
 class RealESRGAN
 {
 public:
-    RealESRGAN(int gpuid = 0, bool tta_mode = false);
+    RealESRGAN(int gpuid = 0, bool tta_mode = false, bool force_fp32 = false);
     ~RealESRGAN();
 
     int load(const std::string& parampath, const std::string& modelpath);
