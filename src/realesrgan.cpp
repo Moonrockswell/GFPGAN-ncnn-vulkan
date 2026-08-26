@@ -47,13 +47,17 @@ static const uint32_t realesrgan_postproc_int8s_spv_data[] = {
     #include "realesrgan_postproc_int8s.spv.hex.h"
 };
 
-RealESRGAN::RealESRGAN(int gpuid, bool _tta_mode)
+RealESRGAN::RealESRGAN(int gpuid, bool _tta_mode, bool force_fp32)
 {
     net.opt.use_vulkan_compute = true;
-    net.opt.use_fp16_packed = true;
-    net.opt.use_fp16_storage = true;
+    // GTX 660 등 구형(Kepler) GPU는 fp16/int8 storage buffer 확장(VK_KHR_16bit_storage/
+    // VK_KHR_8bit_storage)을 드라이버가 불완전하게 지원해서, 겉으론 에러 없이 실행되지만
+    // 타일 결과가 조용히 깨지는(반복/뒤섞임) 사례가 있습니다. -Fp32Only 1로 이 경로를
+    // 강제로 끄고 검증할 수 있게 옵션을 추가했습니다.
+    net.opt.use_fp16_packed = !force_fp32;
+    net.opt.use_fp16_storage = !force_fp32;
     net.opt.use_fp16_arithmetic = false;
-    net.opt.use_int8_storage = true;
+    net.opt.use_int8_storage = !force_fp32;
     net.opt.use_int8_arithmetic = false;
 
     net.set_vulkan_device(gpuid);

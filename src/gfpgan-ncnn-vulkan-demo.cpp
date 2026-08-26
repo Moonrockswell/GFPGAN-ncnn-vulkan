@@ -128,6 +128,10 @@ static void print_usage(const char *progname) {
         C_GREEN "default=png" C_RESET ")\n");
     fprintf(stderr, "  " C_WHITE "-t" C_RESET " tile-size            background upscale tile-size, 0=no tiling "
         C_GREEN "(default = 300)" C_RESET "\n");
+    fprintf(stderr, "  " C_WHITE "-fp32" C_RESET " 0/1                fp16/int8 GPU 최적화 강제 끄기(1=끔), "
+        C_GREEN "(default=0)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
+        "                          구형 GPU(예: Kepler 세대)에서 타일 결과가 깨질 때 진단용\n" C_RESET);
     fprintf(stderr, C_GRAY
         "                          smaller values reduce GPU memory load per step\n"
         "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n" C_RESET);
@@ -764,6 +768,10 @@ int main(int argc, char **argv) {
     bool realesrganModelNameExplicit = false;  // 사용자가 -rn 을 직접 지정했는지 여부
     std::string format;
     int tilesize = 400;  // background upscale tile size, overridable via -t
+    // 구형 GPU(fp16/int8 storage buffer 확장 미지원 또는 드라이버 버그)에서
+    // 타일 결과가 깨질 때 fp32 경로로 강제 전환해 확인할 수 있는 진단용 옵션.
+    // 기본값 false(기존 동작인 fp16/int8 최적화 사용) 유지.
+    bool fp32Only = false;
     int denoiseStrength = 0;  // -dn, 0-100, default off
     int sharpenStrength = 0;  // -sp, 0-100, default off
     int claheStrength = 0;  // -cl, 0-100, default off (CLAHE 자동 대비 향상)
@@ -809,6 +817,8 @@ int main(int argc, char **argv) {
             format = argv[++i];
         } else if (arg == "-t" && i + 1 < argc) {
             tilesize = std::atoi(argv[++i]);
+        } else if (arg == "-fp32" && i + 1 < argc) {
+            fp32Only = std::atoi(argv[++i]) != 0;
         } else if (arg == "-dn" && i + 1 < argc) {
             denoiseStrength = std::atoi(argv[++i]);
         } else if (arg == "-sp" && i + 1 < argc) {
@@ -986,7 +996,7 @@ int main(int argc, char **argv) {
     Face face_detector;
     face_detector.load(modeldir + "/yolov5-blazeface.param", modeldir + "/yolov5-blazeface.bin");
 
-    RealESRGAN real_esrgan;
+    RealESRGAN real_esrgan(0, false, fp32Only);
     // 공식 realesrgan-ncnn-vulkan 배포본의 파일명을 변형 없이 그대로 사용합니다.
     // realesrgan-x4plus / realesrgan-x4plus-anime: 네트워크 구조 자체가 4배
     //   고정이라, 파일명에 배율이 붙지 않습니다. 최종 원하는 배율(-s)이
@@ -1026,7 +1036,7 @@ int main(int argc, char **argv) {
     // RESTORE_WHOLE_IMAGE 매크로와 무관하게(두 빌드 경로 모두) 동작합니다.
     Waifu2xDenoise *waifu2x_denoise = nullptr;
     if (aiDenoiseLevel > 0) {
-        waifu2x_denoise = new Waifu2xDenoise();
+        waifu2x_denoise = new Waifu2xDenoise(0, fp32Only);
         // 공식 waifu2x-ncnn-vulkan models-cunet 배포본과 동일한 파일명
         // (noise1_model.param/.bin ~ noise3_model.param/.bin, scale 접미사
         // 없는 버전 - 배율은 안 바꾸고 노이즈만 제거).

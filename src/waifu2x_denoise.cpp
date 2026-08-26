@@ -38,13 +38,13 @@ static const uint32_t waifu2x_postproc_int8s_spv_data[] = {
     #include "waifu2x_postproc_int8s.spv.hex.h"
 };
 
-Waifu2xDenoise::Waifu2xDenoise(int gpuid)
+Waifu2xDenoise::Waifu2xDenoise(int gpuid, bool force_fp32)
 {
     net.opt.use_vulkan_compute = true;
-    net.opt.use_fp16_packed = true;
-    net.opt.use_fp16_storage = true;
+    net.opt.use_fp16_packed = !force_fp32;
+    net.opt.use_fp16_storage = !force_fp32;
     net.opt.use_fp16_arithmetic = false;
-    net.opt.use_int8_storage = true;
+    net.opt.use_int8_storage = !force_fp32;
     net.opt.use_int8_arithmetic = false;
 
     net.set_vulkan_device(gpuid);
