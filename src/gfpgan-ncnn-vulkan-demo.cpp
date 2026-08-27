@@ -13,6 +13,8 @@
 #include "gfpgan.h"
 #include "face.h"
 #include "realesrgan.h"
+#include "realcugan.h"
+#include "background_upscaler.h"
 #include "waifu2x_denoise.h"
 
 #ifdef _WIN32
@@ -51,6 +53,7 @@ static const char *DEFAULT_MODEL_DIR = "./gfpgan-models";
 // RealESRGAN(배경 업스케일) 모델은 GFPGAN(얼굴 보정) 모델과 별도 폴더에 둡니다.
 // 공식 realesrgan-ncnn-vulkan 배포본의 모델 파일명을 변형 없이 그대로 사용합니다.
 static const char *DEFAULT_REALESRGAN_MODEL_DIR = "./realesrgan-models";
+static const char *DEFAULT_REALCUGAN_MODEL_DIR = "./realcugan-models";
 // waifu2x cunet 노이즈 제거(-nn) 모델도 별도 폴더. 공식 waifu2x-ncnn-vulkan
 // models-cunet 배포본의 noise{1,2,3}_model.param/.bin 파일명을 그대로 사용
 // (scale 접미사 없는 버전 - 배율은 안 바꾸고 노이즈만 제거).
@@ -111,6 +114,8 @@ static void print_usage(const char *progname) {
         C_GRAY "(default=%s)" C_RESET "\n", DEFAULT_MODEL_DIR);
     fprintf(stderr, "  " C_WHITE "-rm" C_RESET " model-path          folder path to the RealESRGAN (background) models "
         C_GRAY "(default=%s)" C_RESET "\n", DEFAULT_REALESRGAN_MODEL_DIR);
+    fprintf(stderr, "  " C_WHITE "-rcm" C_RESET " model-path         folder path to the RealCUGAN (anime/illustration) models "
+        C_GRAY "(default=%s)" C_RESET "\n", DEFAULT_REALCUGAN_MODEL_DIR);
     fprintf(stderr, "  " C_WHITE "-n" C_RESET " model name           GFPGANCleanv1-NoCE-C2 supports only one type of model "
         C_GRAY "(fixed)" C_RESET "\n");
     fprintf(stderr, "  " C_WHITE "-rn" C_RESET " model-name          RealESRGAN model to use; auto-picked from " C_WHITE "-s" C_RESET " if omitted:\n");
@@ -122,8 +127,23 @@ static void print_usage(const char *progname) {
     fprintf(stderr, C_GRAY "                          the GPU work of x4plus; auto default for -s 1/2\n" C_RESET);
     fprintf(stderr, "      " C_GREEN "realesrgan-x4plus" C_RESET "       general photos, native 4x - sharper/more\n");
     fprintf(stderr, C_GRAY "                          detail, roughly double the GPU work; auto default for -s 3/4\n" C_RESET);
-    fprintf(stderr, "      " C_GREEN "realesrgan-x4plus-anime" C_RESET " anime / illustration art\n");
     fprintf(stderr, "      " C_GREEN "realesr-animevideov3" C_RESET "    video frames (lightweight)\n");
+    fprintf(stderr, C_GRAY
+        "                          anime/illustration stills: use RealCUGAN instead (below), it beats\n"
+        "                          realesrgan-x4plus-anime on that content - the -anime RealESRGAN model\n"
+        "                          has been removed from this build\n" C_RESET);
+    fprintf(stderr, "      " C_GREEN "realcugan-pro-2x" C_RESET "        anime/illustration, native 2x, highest quality\n");
+    fprintf(stderr, "      " C_GREEN "realcugan-pro-2x-conservative" C_RESET " same, but preserves original line art\n");
+    fprintf(stderr, C_GRAY "                          more (less aggressive re-drawing)\n" C_RESET);
+    fprintf(stderr, "      " C_GREEN "realcugan-pro-3x" C_RESET "        anime/illustration, native 3x, highest quality\n");
+    fprintf(stderr, "      " C_GREEN "realcugan-pro-3x-conservative" C_RESET " same, but preserves original line art more\n");
+    fprintf(stderr, "      " C_GREEN "realcugan-se-4x" C_RESET "         anime/illustration, native 4x (pro has no 4x model)\n");
+    fprintf(stderr, "      " C_GREEN "realcugan-se-4x-conservative" C_RESET " same, but preserves original line art more\n");
+    fprintf(stderr, "      " C_GREEN "realcugan-se-4x-conservative" C_RESET "  same, but preserves original line art more\n");
+    fprintf(stderr, C_GRAY
+        "                          RealCUGAN models assume -AiDenoise already cleaned up noise/\n"
+        "                          compression artifacts if needed, so only no-denoise/conservative\n"
+        "                          weights are included (no separate denoise-strength model here)\n" C_RESET);
     fprintf(stderr, "  " C_WHITE "-f" C_RESET " output format        output image format (jpg/png/webp, "
         C_GREEN "default=png" C_RESET ")\n");
     fprintf(stderr, "  " C_WHITE "-t" C_RESET " tile-size            background upscale tile-size, 0=no tiling "
@@ -602,7 +622,7 @@ static void apply_detail_enhance(cv::Mat &img, int strength, const cv::Mat &back
 // Models are already loaded, so this can be called repeatedly for batch processing.
 static bool restore_one_image(GFPGAN &gfpgan,
 #if RESTORE_WHOLE_IMAGE
-                               Face &face_detector, RealESRGAN &real_esrgan,
+                               Face &face_detector, BackgroundUpscaler &bg_upscaler,
 #endif
                                Waifu2xDenoise *waifu2x_denoise,
                                const std::string &inputPath, const std::string &outputPath,
@@ -634,7 +654,7 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
 #if RESTORE_WHOLE_IMAGE
     cv::Mat bg_upsample;
-    real_esrgan.tile_process(img, bg_upsample);
+    bg_upscaler.tile_process(img, bg_upsample);
 
     // 얼굴이 실제로 합성되는 영역을 누적할 마스크. 스크래치 제거(-sr)가
     // 이 영역은 절대 건드리지 않고 배경에만 적용되도록 하는 데 씁니다.
@@ -669,11 +689,11 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
     std::vector<cv::Mat> trans_img;
     std::vector<cv::Mat> trans_matrix_inv;
-    // real_esrgan.scale: realesrgan-x4plus 모델의 네이티브 배율(4).
+    // bg_upscaler.scale: realesrgan-x4plus 모델의 네이티브 배율(4).
     // bg_upsample이 실제로 이 배율로 만들어지므로, 얼굴을 붙여넣을 좌표
     // 변환도 반드시 같은 배율을 써야 얼굴이 배경 위 정확한 위치에
     // 합성됩니다.
-    face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img, real_esrgan.scale);
+    face_detector.align_warp_face(img, objects, trans_matrix_inv, trans_img, bg_upscaler.scale);
 
     for (size_t i = 0; i < objects.size(); i++) {
         ncnn::Mat gfpgan_result;
@@ -693,11 +713,11 @@ static bool restore_one_image(GFPGAN &gfpgan,
     // 누리면서 최종 결과물 크기만 원하는 배율로 맞추기 위해 합성이 끝난
     // 직후 리사이즈합니다. 후처리(디노이즈/샤프닝)는 이 리사이즈가 끝난
     // "최종 배포 크기" 기준으로 적용되도록 그 다음에 수행합니다.
-    if (scale != real_esrgan.scale) {
+    if (scale != bg_upscaler.scale) {
         cv::Size targetSize(img.cols * scale, img.rows * scale);
         // 축소(다운샘플)는 INTER_AREA가, 확대(업샘플)는 INTER_LANCZOS4가
         // 더 선명하고 계단현상이 적어서 방향에 따라 보간 방식을 다르게 씁니다.
-        int interp = (scale < real_esrgan.scale) ? cv::INTER_AREA : cv::INTER_LANCZOS4;
+        int interp = (scale < bg_upscaler.scale) ? cv::INTER_AREA : cv::INTER_LANCZOS4;
         cv::resize(bg_upsample, bg_upsample, targetSize, 0, 0, interp);
         cv::resize(faceRegionMask, faceRegionMask, targetSize, 0, 0, cv::INTER_NEAREST);
     }
@@ -763,8 +783,10 @@ int main(int argc, char **argv) {
     std::string outputpath;
     std::string modeldir = DEFAULT_MODEL_DIR;
     std::string realesrganModelDir = DEFAULT_REALESRGAN_MODEL_DIR;  // -rm
+    std::string realcuganModelDir = DEFAULT_REALCUGAN_MODEL_DIR;    // -rcm
     std::string realesrganModelName = "realesrgan-x2plus";  // -rn, 이미지 종류에 맞게 선택
                                       // (명시적으로 안 주면 -s 값을 보고 아래에서 자동 결정됨)
+                                      // realcugan-* 값을 주면 RealESRGAN이 아니라 RealCUGAN을 씀
     bool realesrganModelNameExplicit = false;  // 사용자가 -rn 을 직접 지정했는지 여부
     std::string format;
     int tilesize = 400;  // background upscale tile size, overridable via -t
@@ -810,6 +832,8 @@ int main(int argc, char **argv) {
             modeldir = argv[++i];
         } else if (arg == "-rm" && i + 1 < argc) {
             realesrganModelDir = argv[++i];
+        } else if (arg == "-rcm" && i + 1 < argc) {
+            realcuganModelDir = argv[++i];
         } else if (arg == "-rn" && i + 1 < argc) {
             realesrganModelName = argv[++i];
             realesrganModelNameExplicit = true;
@@ -906,12 +930,35 @@ int main(int argc, char **argv) {
         realesrganModelName = (scale <= 2) ? "realesrgan-x2plus" : "realesrgan-x4plus";
     }
 
-    if (realesrganModelName != "realesrgan-x4plus"
-        && realesrganModelName != "realesrgan-x4plus-anime"
+    // realcugan-*는 별도 클래스(RealCUGAN)로 처리되므로, 이름 검증도
+    // RealESRGAN 계열과 RealCUGAN 계열로 나눠서 합니다.
+    const bool useRealCUGAN = realesrganModelName.rfind("realcugan-", 0) == 0;
+
+    if (!useRealCUGAN
+        && realesrganModelName != "realesrgan-x4plus"
         && realesrganModelName != "realesrgan-x2plus"
         && realesrganModelName != "realesr-animevideov3") {
         fprintf(stderr, "Error: -rn model-name must be one of realesrgan-x4plus, "
-                         "realesrgan-x4plus-anime, realesrgan-x2plus, realesr-animevideov3 (got '%s')\n\n",
+                         "realesrgan-x2plus, realesr-animevideov3, realcugan-pro-2x, "
+                         "realcugan-pro-2x-conservative, realcugan-pro-3x, "
+                         "realcugan-pro-3x-conservative, realcugan-se-4x, "
+                         "realcugan-se-4x-conservative (got '%s')\n\n",
+                realesrganModelName.c_str());
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (useRealCUGAN
+        && realesrganModelName != "realcugan-pro-2x"
+        && realesrganModelName != "realcugan-pro-2x-conservative"
+        && realesrganModelName != "realcugan-pro-3x"
+        && realesrganModelName != "realcugan-pro-3x-conservative"
+        && realesrganModelName != "realcugan-se-4x"
+        && realesrganModelName != "realcugan-se-4x-conservative") {
+        fprintf(stderr, "Error: -rn realcugan model-name must be one of realcugan-pro-2x, "
+                         "realcugan-pro-2x-conservative, realcugan-pro-3x, "
+                         "realcugan-pro-3x-conservative, realcugan-se-4x, "
+                         "realcugan-se-4x-conservative (got '%s')\n\n",
                 realesrganModelName.c_str());
         print_usage(argv[0]);
         return -1;
@@ -988,6 +1035,9 @@ int main(int argc, char **argv) {
     if (!realesrganModelDir.empty() && (realesrganModelDir.back() == '/' || realesrganModelDir.back() == '\\')) {
         realesrganModelDir.pop_back();
     }
+    if (!realcuganModelDir.empty() && (realcuganModelDir.back() == '/' || realcuganModelDir.back() == '\\')) {
+        realcuganModelDir.pop_back();
+    }
 
     GFPGAN gfpgan;
     gfpgan.load(modeldir + "/encoder.param", modeldir + "/encoder.bin", modeldir + "/style.bin");
@@ -997,10 +1047,13 @@ int main(int argc, char **argv) {
     face_detector.load(modeldir + "/yolov5-blazeface.param", modeldir + "/yolov5-blazeface.bin");
 
     RealESRGAN real_esrgan(0, false, fp32Only);
+    RealCUGAN real_cugan(0, fp32Only);
+    BackgroundUpscaler bg_upscaler;
+
     // 공식 realesrgan-ncnn-vulkan 배포본의 파일명을 변형 없이 그대로 사용합니다.
-    // realesrgan-x4plus / realesrgan-x4plus-anime: 네트워크 구조 자체가 4배
-    //   고정이라, 파일명에 배율이 붙지 않습니다. 최종 원하는 배율(-s)이
-    //   4가 아니면 4배로 처리한 뒤 나중에 리사이즈합니다 (restore_one_image 참고).
+    // realesrgan-x4plus: 네트워크 구조 자체가 4배 고정이라, 파일명에 배율이
+    //   붙지 않습니다. 최종 원하는 배율(-s)이 4가 아니면 4배로 처리한 뒤
+    //   나중에 리사이즈합니다 (restore_one_image 참고).
     // realesrgan-x2plus: 위와 같은 계열(RRDB)이지만 네트워크 구조 자체가 2배
     //   고정입니다. x4plus 대비 GPU 연산량이 대략 절반이라, 저사양 GPU에서
     //   화질과 속도의 절충안으로 씁니다. -s가 2가 아니면 2배로 처리한 뒤
@@ -1008,27 +1061,78 @@ int main(int argc, char **argv) {
     // realesr-animevideov3: 배율별로 별도 모델(-x2/-x3/-x4)이 나뉘어 있어서,
     //   원하는 최종 배율(-s)에 맞는 파일을 바로 불러오면 되고, 후처리
     //   리사이즈가 필요 없습니다.
-    std::string realesrganParam, realesrganModel;
-    if (realesrganModelName == "realesr-animevideov3") {
-        // animevideov3는 2/3/4배 모델만 배포되고 1배(원본 크기) 모델은 없습니다.
-        // -s 1을 고른 경우, 가장 작은 x2 모델을 불러온 뒤 restore_one_image의
-        // 리사이즈 단계(scale != real_esrgan.scale)에서 1배로 축소되도록 합니다.
-        int modelScale = (scale == 1) ? 2 : scale;
-        std::string suffix = "-x" + std::to_string(modelScale);
-        realesrganParam = realesrganModelDir + "/" + realesrganModelName + suffix + ".param";
-        realesrganModel = realesrganModelDir + "/" + realesrganModelName + suffix + ".bin";
-        real_esrgan.scale = modelScale;
+    // realcugan-*: 애니메이션/일러스트 전용(realesrgan-x4plus-anime를 대체).
+    //   -rn 값 -> 실제 모델 파일명 매핑은 realcugan-models 폴더에 실제로
+    //   들어있는 파일 이름(pro/se 폴더에서 골라온 5개) 기준입니다.
+    //   noise 레벨 모델(denoise3x)은 애초에 채택하지 않았으므로 여기 없음
+    //   (-AiDenoise로 이미 노이즈 제거를 마쳤다고 가정).
+    if (useRealCUGAN) {
+        std::string realcuganFile;
+        int cuganScale;
+        if (realesrganModelName == "realcugan-pro-2x") {
+            realcuganFile = "up2x-no-denoise";
+            cuganScale = 2;
+        } else if (realesrganModelName == "realcugan-pro-2x-conservative") {
+            realcuganFile = "up2x-conservative";
+            cuganScale = 2;
+        } else if (realesrganModelName == "realcugan-pro-3x") {
+            realcuganFile = "up3x-no-denoise";
+            cuganScale = 3;
+        } else if (realesrganModelName == "realcugan-pro-3x-conservative") {
+            realcuganFile = "up3x-conservative";
+            cuganScale = 3;
+        } else if (realesrganModelName == "realcugan-se-4x") {
+            realcuganFile = "up4x-no-denoise";
+            cuganScale = 4;
+        } else { // realcugan-se-4x-conservative (up4x는 pro에 없어서 se에서만 가져옴)
+            realcuganFile = "up4x-conservative";
+            cuganScale = 4;
+        }
+
+        std::string realcuganParam = realcuganModelDir + "/" + realcuganFile + ".param";
+        std::string realcuganModel = realcuganModelDir + "/" + realcuganFile + ".bin";
+
+        if (real_cugan.load(realcuganParam, realcuganModel) < 0) {
+            fprintf(stderr, "Error: failed to load RealCUGAN model '%s' from '%s'\n",
+                    realesrganModelName.c_str(), realcuganModelDir.c_str());
+            return -1;
+        }
+
+        bg_upscaler.set_backend(&real_cugan);
+        bg_upscaler.set_scale(cuganScale);
+        bg_upscaler.set_tile_size(tilesize);
     } else {
-        realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
-        realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
-        // x4plus / x4plus-anime는 네트워크 구조상 4배 고정, x2plus는 2배 고정.
-        // (x2plus는 입력 단에서 pixel-unshuffle로 공간 해상도를 먼저 절반으로
-        // 줄이고 그만큼 채널을 늘린 뒤 RRDB를 거치는 구조라, x4plus와 파라미터
-        // 수/레이어 수는 비슷해도 최종 네이티브 배율은 2배입니다.)
-        real_esrgan.scale = (realesrganModelName == "realesrgan-x2plus") ? 2 : 4;
+        std::string realesrganParam, realesrganModel;
+        int esrganScale;
+        if (realesrganModelName == "realesr-animevideov3") {
+            // animevideov3는 2/3/4배 모델만 배포되고 1배(원본 크기) 모델은 없습니다.
+            // -s 1을 고른 경우, 가장 작은 x2 모델을 불러온 뒤 restore_one_image의
+            // 리사이즈 단계(scale != bg_upscaler.scale)에서 1배로 축소되도록 합니다.
+            int modelScale = (scale == 1) ? 2 : scale;
+            std::string suffix = "-x" + std::to_string(modelScale);
+            realesrganParam = realesrganModelDir + "/" + realesrganModelName + suffix + ".param";
+            realesrganModel = realesrganModelDir + "/" + realesrganModelName + suffix + ".bin";
+            esrganScale = modelScale;
+        } else {
+            realesrganParam = realesrganModelDir + "/" + realesrganModelName + ".param";
+            realesrganModel = realesrganModelDir + "/" + realesrganModelName + ".bin";
+            // x4plus는 네트워크 구조상 4배 고정, x2plus는 2배 고정.
+            // (x2plus는 입력 단에서 pixel-unshuffle로 공간 해상도를 먼저 절반으로
+            // 줄이고 그만큼 채널을 늘린 뒤 RRDB를 거치는 구조라, x4plus와 파라미터
+            // 수/레이어 수는 비슷해도 최종 네이티브 배율은 2배입니다.)
+            esrganScale = (realesrganModelName == "realesrgan-x2plus") ? 2 : 4;
+        }
+
+        if (real_esrgan.load(realesrganParam, realesrganModel) < 0) {
+            fprintf(stderr, "Error: failed to load RealESRGAN model '%s' from '%s'\n",
+                    realesrganModelName.c_str(), realesrganModelDir.c_str());
+            return -1;
+        }
+
+        bg_upscaler.set_backend(&real_esrgan);
+        bg_upscaler.set_scale(esrganScale);
+        bg_upscaler.set_tile_size(tilesize);
     }
-    real_esrgan.load(realesrganParam, realesrganModel);
-    real_esrgan.tile_size = tilesize;   // -t 로 넘긴 값 적용 (기본 400)
 #endif
 
     // -nn(AI 노이즈 제거): 0(기본, 꺼짐)이면 Waifu2xDenoise를 아예 만들지
@@ -1075,7 +1179,7 @@ int main(int argc, char **argv) {
 
             fprintf(stderr, "Processing %s -> %s\n", entry.path().string().c_str(), outPath.c_str());
 #if RESTORE_WHOLE_IMAGE
-            if (restore_one_image(gfpgan, face_detector, real_esrgan, waifu2x_denoise, entry.path().string(), outPath,
+            if (restore_one_image(gfpgan, face_detector, bg_upscaler, waifu2x_denoise, entry.path().string(), outPath,
                                    denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #else
             if (restore_one_image(gfpgan, waifu2x_denoise, entry.path().string(), outPath,
@@ -1106,7 +1210,7 @@ int main(int argc, char **argv) {
         }
 
 #if RESTORE_WHOLE_IMAGE
-        if (!restore_one_image(gfpgan, face_detector, real_esrgan, waifu2x_denoise, imagepath, outPath,
+        if (!restore_one_image(gfpgan, face_detector, bg_upscaler, waifu2x_denoise, imagepath, outPath,
                                 denoiseStrength, sharpenStrength, claheStrength, scale, maxFaces, whiteBalance, detailEnhanceStrength, vignetteStrength, scratchStrength, faceRestore)) {
 #else
         if (!restore_one_image(gfpgan, waifu2x_denoise, imagepath, outPath,
