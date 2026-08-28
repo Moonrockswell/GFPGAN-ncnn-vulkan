@@ -68,7 +68,9 @@ RealCUGAN::RealCUGAN(int gpuid, bool force_fp32)
 
     // 아래 값들은 -rn 으로 어떤 RealCUGAN 모델(up2x/up3x/up4x-*)이
     // 로드되는지에 따라 gfpgan-ncnn-vulkan-demo.cpp의 main()에서
-    // 다시 설정됩니다.
+    // 다시 설정됩니다. tile_pad는 특히 중요 - RealCUGAN은 valid-conv라
+    // 배율별 정확한 값(scale 2->18, 3->14, 4->19, 공식 구현 기준)을
+    // 반드시 다시 설정해야 하며, 여기 10은 그 전까지의 임시값일 뿐입니다.
     scale = 2;
     tile_size = 400;
     tile_pad = 10;

@@ -1101,6 +1101,15 @@ int main(int argc, char **argv) {
         bg_upscaler.set_backend(&real_cugan);
         bg_upscaler.set_scale(cuganScale);
         bg_upscaler.set_tile_size(tilesize);
+        // RealCUGAN은 valid-conv(패딩 없음) 구조라, 타일 주변에 얼마나 여유
+        // 컨텍스트(prepadding)를 줘야 하는지가 RealESRGAN(prepadding=10 고정)과
+        // 전혀 다릅니다. 배율마다 정확히 이 값이어야 네트워크 출력 크기가
+        // 딱 맞아떨어집니다 (공식 realcugan-ncnn-vulkan main.cpp 기준값 -
+        // models-se/pro/nose 공통). 이 값이 안 맞으면 출력 타일 크기가
+        // 어긋나서 이미지가 잘게 쪼개져 잘못 이어붙는 증상이 납니다.
+        if (cuganScale == 2) real_cugan.tile_pad = 18;
+        else if (cuganScale == 3) real_cugan.tile_pad = 14;
+        else real_cugan.tile_pad = 19; // cuganScale == 4
     } else {
         std::string realesrganParam, realesrganModel;
         int esrganScale;
