@@ -152,6 +152,11 @@ static void print_usage(const char *progname) {
         C_GREEN "(default=0)" C_RESET "\n");
     fprintf(stderr, C_GRAY
         "                          구형 GPU(예: Kepler 세대)에서 타일 결과가 깨질 때 진단용\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-syncgap" C_RESET " 0/1             RealCUGAN 타일 경계 SE 게이트 동기화(1=켬), "
+        C_GREEN "(default=0)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
+        "                          은은한 격자 얼룩 제거용, 처리 시간 약 2배로 늘어남\n"
+        "                          (RealESRGAN 모델 사용 시엔 무시됨)\n" C_RESET);
     fprintf(stderr, C_GRAY
         "                          smaller values reduce GPU memory load per step\n"
         "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n" C_RESET);
@@ -794,6 +799,12 @@ int main(int argc, char **argv) {
     // 타일 결과가 깨질 때 fp32 경로로 강제 전환해 확인할 수 있는 진단용 옵션.
     // 기본값 false(기존 동작인 fp16/int8 최적화 사용) 유지.
     bool fp32Only = false;
+    // RealCUGAN 전용 - 켜면 타일 경계의 SE(Squeeze-Excitation) 게이트를
+    // 전체 이미지 기준으로 동기화해서 은은한 격자 얼룩을 없앰. 신경망을
+    // 사실상 2번 통과해야 해서 처리 시간이 대략 2배로 늘어나므로 기본은 끔.
+    // RealESRGAN 모델을 쓸 때는 이 값 자체가 무시됨(RealESRGAN엔 SE 레이어가
+    // 없어서 애초에 해당 없음).
+    int syncGap = 0;
     int denoiseStrength = 0;  // -dn, 0-100, default off
     int sharpenStrength = 0;  // -sp, 0-100, default off
     int claheStrength = 0;  // -cl, 0-100, default off (CLAHE 자동 대비 향상)
@@ -843,6 +854,8 @@ int main(int argc, char **argv) {
             tilesize = std::atoi(argv[++i]);
         } else if (arg == "-fp32" && i + 1 < argc) {
             fp32Only = std::atoi(argv[++i]) != 0;
+        } else if (arg == "-syncgap" && i + 1 < argc) {
+            syncGap = std::atoi(argv[++i]);
         } else if (arg == "-dn" && i + 1 < argc) {
             denoiseStrength = std::atoi(argv[++i]);
         } else if (arg == "-sp" && i + 1 < argc) {
@@ -1110,6 +1123,7 @@ int main(int argc, char **argv) {
         if (cuganScale == 2) real_cugan.tile_pad = 18;
         else if (cuganScale == 3) real_cugan.tile_pad = 14;
         else real_cugan.tile_pad = 19; // cuganScale == 4
+        real_cugan.syncgap = syncGap;
     } else {
         std::string realesrganParam, realesrganModel;
         int esrganScale;

@@ -74,6 +74,7 @@ RealCUGAN::RealCUGAN(int gpuid, bool force_fp32)
     scale = 2;
     tile_size = 400;
     tile_pad = 10;
+    syncgap = 0;
 }
 
 RealCUGAN::~RealCUGAN()
@@ -139,6 +140,13 @@ int RealCUGAN::load(const std::string& parampath, const std::string& modelpath)
 }
 
 int RealCUGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
+{
+    if (syncgap)
+        return tile_process_syncgap(inimage, outimage);
+    return tile_process_plain(inimage, outimage);
+}
+
+int RealCUGAN::tile_process_plain(const cv::Mat& inimage, cv::Mat& outimage)
 {
     // 이 프로젝트는 항상 3채널 BGR(cv::imread(..., 1))만 다룹니다.
     const int channels = 3;
@@ -392,6 +400,543 @@ int RealCUGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 
     net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
     net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
+
+    return 0;
+}
+
+// ===========================================================================
+// syncgap ("rough" 버전) - 공식 realcugan-ncnn-vulkan의 process_se_rough를
+// 이 프로젝트 컨벤션으로 이식. 3단계: (1) 타일마다 gap0~gap3을 뽑아 캐시에
+// 저장 (2) 전체 타일에 대해 각 gap을 평균 내서 하나의 값으로 합침 (3) 그
+// 동기화된 값을 모든 타일에 주입해서 최종 출력을 만듦. tile_process_plain과
+// 거의 같은 타일 크롭/패딩 로직을 쓰지만, 신경망을 사실상 2번(1단계+3단계)
+// 통과해야 해서 처리 시간이 대략 2배가 됩니다.
+// ===========================================================================
+
+int RealCUGAN::tile_process_syncgap(const cv::Mat& inimage, cv::Mat& outimage)
+{
+    const int w = inimage.cols;
+    const int h = inimage.rows;
+    const int TILE_SIZE_X = tile_size > 0 ? tile_size : w;
+    const int TILE_SIZE_Y = tile_size > 0 ? tile_size : h;
+    const int xtiles = (w + TILE_SIZE_X - 1) / TILE_SIZE_X;
+    const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
+
+    ncnn::VkAllocator* blob_vkallocator = net.vulkan_device()->acquire_blob_allocator();
+    ncnn::VkAllocator* staging_vkallocator = net.vulkan_device()->acquire_staging_allocator();
+
+    ncnn::Option opt = net.opt;
+    opt.blob_vkallocator = blob_vkallocator;
+    opt.workspace_vkallocator = blob_vkallocator;
+    opt.staging_vkallocator = staging_vkallocator;
+
+    FeatureCache cache;
+
+    std::vector<std::string> gapnames = {"gap0", "gap1", "gap2", "gap3"};
+
+    int ret = syncgap_stage0(inimage, gapnames, opt, blob_vkallocator, staging_vkallocator, cache);
+    if (ret != 0) {
+        net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
+        net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
+        return ret;
+    }
+
+    ret = syncgap_sync(gapnames, opt, xtiles, ytiles, cache);
+    if (ret != 0) {
+        net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
+        net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
+        return ret;
+    }
+
+    ret = syncgap_stage2(inimage, gapnames, outimage, opt, blob_vkallocator, staging_vkallocator, cache);
+
+    cache.clear();
+    net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
+    net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
+
+    return ret;
+}
+
+int RealCUGAN::syncgap_stage0(const cv::Mat& inimage, const std::vector<std::string>& outnames,
+                               const ncnn::Option& opt, ncnn::VkAllocator* blob_vkallocator,
+                               ncnn::VkAllocator* staging_vkallocator, FeatureCache& cache)
+{
+    const int channels = 3;
+    const int w = inimage.cols;
+    const int h = inimage.rows;
+
+    const unsigned char* pixeldata = inimage.isContinuous() ? inimage.data : nullptr;
+    cv::Mat inimage_cont;
+    if (!pixeldata)
+    {
+        inimage_cont = inimage.clone();
+        pixeldata = inimage_cont.data;
+    }
+
+    const int TILE_SIZE_X = tile_size > 0 ? tile_size : w;
+    const int TILE_SIZE_Y = tile_size > 0 ? tile_size : h;
+    const int prepadding = tile_pad;
+
+    const int xtiles = (w + TILE_SIZE_X - 1) / TILE_SIZE_X;
+    const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
+
+    const size_t in_out_tile_elemsize = opt.use_fp16_storage ? 2u : 4u;
+
+    for (int yi = 0; yi < ytiles; yi++)
+    {
+        const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
+        int prepadding_bottom = prepadding;
+        if (scale == 3)
+        {
+            prepadding_bottom += (tile_h_nopad + 3) / 4 * 4 - tile_h_nopad;
+        }
+        if (scale == 2 || scale == 4)
+        {
+            prepadding_bottom += (tile_h_nopad + 1) / 2 * 2 - tile_h_nopad;
+        }
+
+        int in_tile_y0 = std::max(yi * TILE_SIZE_Y - prepadding, 0);
+        int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding_bottom, h);
+
+        ncnn::Mat in;
+        if (opt.use_fp16_storage && opt.use_int8_storage)
+        {
+            in = ncnn::Mat(w, (in_tile_y1 - in_tile_y0), (void*)(pixeldata + (size_t)in_tile_y0 * w * channels), (size_t)channels, 1);
+        }
+        else
+        {
+            in = ncnn::Mat::from_pixels(pixeldata + (size_t)in_tile_y0 * w * channels, ncnn::Mat::PIXEL_BGR, w, (in_tile_y1 - in_tile_y0));
+        }
+
+        ncnn::VkCompute cmd(net.vulkan_device());
+
+        ncnn::VkMat in_gpu;
+        {
+            cmd.record_clone(in, in_gpu, opt);
+
+            if (xtiles > 1)
+            {
+                cmd.submit_and_wait();
+                cmd.reset();
+            }
+        }
+
+        for (int xi = 0; xi < xtiles; xi++)
+        {
+            const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
+            int prepadding_right = prepadding;
+            if (scale == 3)
+            {
+                prepadding_right += (tile_w_nopad + 3) / 4 * 4 - tile_w_nopad;
+            }
+            if (scale == 2 || scale == 4)
+            {
+                prepadding_right += (tile_w_nopad + 1) / 2 * 2 - tile_w_nopad;
+            }
+
+            ncnn::VkMat in_tile_gpu;
+            {
+                int tile_x0 = xi * TILE_SIZE_X - prepadding;
+                int tile_x1 = std::min((xi + 1) * TILE_SIZE_X, w) + prepadding_right;
+                int tile_y0 = yi * TILE_SIZE_Y - prepadding;
+                int tile_y1 = std::min((yi + 1) * TILE_SIZE_Y, h) + prepadding_bottom;
+
+                in_tile_gpu.create(tile_x1 - tile_x0, tile_y1 - tile_y0, 3, in_out_tile_elemsize, 1, blob_vkallocator);
+
+                ncnn::VkMat dummy_alpha;
+
+                std::vector<ncnn::VkMat> bindings(3);
+                bindings[0] = in_gpu;
+                bindings[1] = in_tile_gpu;
+                bindings[2] = dummy_alpha;
+
+                std::vector<ncnn::vk_constant_type> constants(13);
+                constants[0].i = in_gpu.w;
+                constants[1].i = in_gpu.h;
+                constants[2].i = in_gpu.cstep;
+                constants[3].i = in_tile_gpu.w;
+                constants[4].i = in_tile_gpu.h;
+                constants[5].i = in_tile_gpu.cstep;
+                constants[6].i = prepadding;
+                constants[7].i = prepadding;
+                constants[8].i = xi * TILE_SIZE_X;
+                constants[9].i = std::min(yi * TILE_SIZE_Y, prepadding);
+                constants[10].i = channels;
+                constants[11].i = 0;
+                constants[12].i = 0;
+
+                ncnn::VkMat dispatcher;
+                dispatcher.w = in_tile_gpu.w;
+                dispatcher.h = in_tile_gpu.h;
+                dispatcher.c = channels;
+
+                cmd.record_pipeline(realcugan_preproc, bindings, constants, dispatcher);
+            }
+
+            {
+                ncnn::Extractor ex = net.create_extractor();
+
+                ex.set_blob_vkallocator(blob_vkallocator);
+                ex.set_workspace_vkallocator(blob_vkallocator);
+                ex.set_staging_vkallocator(staging_vkallocator);
+
+                ex.input("in0", in_tile_gpu);
+
+                for (size_t i = 0; i < outnames.size(); i++)
+                {
+                    ncnn::VkMat feat;
+                    ex.extract(outnames[i].c_str(), feat, cmd);
+                    cache.save(yi, xi, outnames[i], feat);
+                }
+            }
+
+            if (xtiles > 1)
+            {
+                cmd.submit_and_wait();
+                cmd.reset();
+            }
+        }
+
+        cmd.submit_and_wait();
+        cmd.reset();
+    }
+
+    return 0;
+}
+
+int RealCUGAN::syncgap_sync(const std::vector<std::string>& names, const ncnn::Option& opt,
+                             int xtiles, int ytiles, FeatureCache& cache)
+{
+    std::vector<std::vector<ncnn::VkMat> > feats(names.size());
+    for (int yi = 0; yi < ytiles; yi++)
+    {
+        for (int xi = 0; xi < xtiles; xi++)
+        {
+            for (size_t i = 0; i < names.size(); i++)
+            {
+                ncnn::VkMat feat;
+                cache.load(yi, xi, names[i], feat);
+                feats[i].push_back(feat);
+            }
+        }
+    }
+
+    const int tiles = ytiles * xtiles;
+
+    ncnn::VkCompute cmd(net.vulkan_device());
+
+    // 다운로드
+    std::vector<std::vector<ncnn::Mat> > feats_cpu(names.size());
+    for (size_t i = 0; i < names.size(); i++)
+    {
+        feats_cpu[i].resize(tiles);
+        for (int j = 0; j < tiles; j++)
+        {
+            cmd.record_download(feats[i][j], feats_cpu[i][j], opt);
+        }
+    }
+    cmd.submit_and_wait();
+    cmd.reset();
+
+    // 전체 평균 -> 다시 업로드
+    std::vector<ncnn::VkMat> avgfeats(names.size());
+    for (size_t i = 0; i < names.size(); i++)
+    {
+        for (int j = 0; j < tiles; j++)
+        {
+            if (opt.use_packing_layout && feats_cpu[i][j].elempack != 1)
+            {
+                ncnn::Mat feat_cpu_unpacked;
+                ncnn::convert_packing(feats_cpu[i][j], feat_cpu_unpacked, 1, opt);
+                feats_cpu[i][j] = feat_cpu_unpacked;
+            }
+        }
+
+        ncnn::Mat avgfeat;
+        avgfeat.create_like(feats_cpu[i][0]);
+        avgfeat.fill(0.f);
+
+        int len = (int)avgfeat.total();
+        for (int j = 0; j < tiles; j++)
+        {
+            const ncnn::Mat f = feats_cpu[i][j];
+            for (int k = 0; k < len; k++)
+            {
+                avgfeat[k] += f[k];
+            }
+        }
+        for (int k = 0; k < len; k++)
+        {
+            avgfeat[k] /= tiles;
+        }
+
+        cmd.record_upload(avgfeat, avgfeats[i], opt);
+    }
+    cmd.submit_and_wait();
+    cmd.reset();
+
+    // 모든 타일 위치에 같은(동기화된) 값을 다시 저장
+    for (int yi = 0; yi < ytiles; yi++)
+    {
+        for (int xi = 0; xi < xtiles; xi++)
+        {
+            for (size_t i = 0; i < names.size(); i++)
+            {
+                cache.save(yi, xi, names[i], avgfeats[i]);
+            }
+        }
+    }
+
+    return 0;
+}
+
+int RealCUGAN::syncgap_stage2(const cv::Mat& inimage, const std::vector<std::string>& names,
+                               cv::Mat& outimage, const ncnn::Option& opt,
+                               ncnn::VkAllocator* blob_vkallocator, ncnn::VkAllocator* staging_vkallocator,
+                               FeatureCache& cache)
+{
+    const int channels = 3;
+    const int w = inimage.cols;
+    const int h = inimage.rows;
+
+    outimage.create(h * scale, w * scale, CV_8UC3);
+
+    const unsigned char* pixeldata = inimage.isContinuous() ? inimage.data : nullptr;
+    cv::Mat inimage_cont;
+    if (!pixeldata)
+    {
+        inimage_cont = inimage.clone();
+        pixeldata = inimage_cont.data;
+    }
+
+    const int TILE_SIZE_X = tile_size > 0 ? tile_size : w;
+    const int TILE_SIZE_Y = tile_size > 0 ? tile_size : h;
+    const int prepadding = tile_pad;
+
+    const int xtiles = (w + TILE_SIZE_X - 1) / TILE_SIZE_X;
+    const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
+
+    const size_t in_out_tile_elemsize = opt.use_fp16_storage ? 2u : 4u;
+
+    for (int yi = 0; yi < ytiles; yi++)
+    {
+        const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
+        int prepadding_bottom = prepadding;
+        if (scale == 3)
+        {
+            prepadding_bottom += (tile_h_nopad + 3) / 4 * 4 - tile_h_nopad;
+        }
+        if (scale == 2 || scale == 4)
+        {
+            prepadding_bottom += (tile_h_nopad + 1) / 2 * 2 - tile_h_nopad;
+        }
+
+        int in_tile_y0 = std::max(yi * TILE_SIZE_Y - prepadding, 0);
+        int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding_bottom, h);
+
+        ncnn::Mat in;
+        if (opt.use_fp16_storage && opt.use_int8_storage)
+        {
+            in = ncnn::Mat(w, (in_tile_y1 - in_tile_y0), (void*)(pixeldata + (size_t)in_tile_y0 * w * channels), (size_t)channels, 1);
+        }
+        else
+        {
+            in = ncnn::Mat::from_pixels(pixeldata + (size_t)in_tile_y0 * w * channels, ncnn::Mat::PIXEL_BGR, w, (in_tile_y1 - in_tile_y0));
+        }
+
+        ncnn::VkCompute cmd(net.vulkan_device());
+
+        ncnn::VkMat in_gpu;
+        {
+            cmd.record_clone(in, in_gpu, opt);
+
+            if (xtiles > 1)
+            {
+                cmd.submit_and_wait();
+                cmd.reset();
+            }
+        }
+
+        int out_tile_y0 = std::max(yi * TILE_SIZE_Y, 0);
+        int out_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y, h);
+
+        ncnn::VkMat out_gpu;
+        if (opt.use_fp16_storage && opt.use_int8_storage)
+        {
+            out_gpu.create(w * scale, (out_tile_y1 - out_tile_y0) * scale, (size_t)channels, 1, blob_vkallocator);
+        }
+        else
+        {
+            out_gpu.create(w * scale, (out_tile_y1 - out_tile_y0) * scale, channels, (size_t)4u, 1, blob_vkallocator);
+        }
+
+        for (int xi = 0; xi < xtiles; xi++)
+        {
+            const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
+            int prepadding_right = prepadding;
+            if (scale == 3)
+            {
+                prepadding_right += (tile_w_nopad + 3) / 4 * 4 - tile_w_nopad;
+            }
+            if (scale == 2 || scale == 4)
+            {
+                prepadding_right += (tile_w_nopad + 1) / 2 * 2 - tile_w_nopad;
+            }
+
+            ncnn::VkMat in_tile_gpu;
+            {
+                int tile_x0 = xi * TILE_SIZE_X - prepadding;
+                int tile_x1 = std::min((xi + 1) * TILE_SIZE_X, w) + prepadding_right;
+                int tile_y0 = yi * TILE_SIZE_Y - prepadding;
+                int tile_y1 = std::min((yi + 1) * TILE_SIZE_Y, h) + prepadding_bottom;
+
+                in_tile_gpu.create(tile_x1 - tile_x0, tile_y1 - tile_y0, 3, in_out_tile_elemsize, 1, blob_vkallocator);
+
+                ncnn::VkMat dummy_alpha;
+
+                std::vector<ncnn::VkMat> bindings(3);
+                bindings[0] = in_gpu;
+                bindings[1] = in_tile_gpu;
+                bindings[2] = dummy_alpha;
+
+                std::vector<ncnn::vk_constant_type> constants(13);
+                constants[0].i = in_gpu.w;
+                constants[1].i = in_gpu.h;
+                constants[2].i = in_gpu.cstep;
+                constants[3].i = in_tile_gpu.w;
+                constants[4].i = in_tile_gpu.h;
+                constants[5].i = in_tile_gpu.cstep;
+                constants[6].i = prepadding;
+                constants[7].i = prepadding;
+                constants[8].i = xi * TILE_SIZE_X;
+                constants[9].i = std::min(yi * TILE_SIZE_Y, prepadding);
+                constants[10].i = channels;
+                constants[11].i = 0;
+                constants[12].i = 0;
+
+                ncnn::VkMat dispatcher;
+                dispatcher.w = in_tile_gpu.w;
+                dispatcher.h = in_tile_gpu.h;
+                dispatcher.c = channels;
+
+                cmd.record_pipeline(realcugan_preproc, bindings, constants, dispatcher);
+            }
+
+            ncnn::VkMat out_tile_gpu;
+            {
+                ncnn::Extractor ex = net.create_extractor();
+
+                ex.set_blob_vkallocator(blob_vkallocator);
+                ex.set_workspace_vkallocator(blob_vkallocator);
+                ex.set_staging_vkallocator(staging_vkallocator);
+
+                ex.input("in0", in_tile_gpu);
+
+                // syncgap_sync에서 전체 이미지 기준으로 동기화해둔 gap 값을
+                // 여기서 주입합니다 - 이게 syncgap의 핵심(타일별 SE 국소
+                // 계산을 전역 평균으로 덮어씀).
+                for (size_t i = 0; i < names.size(); i++)
+                {
+                    ncnn::VkMat feat;
+                    cache.load(yi, xi, names[i], feat);
+                    ex.input(names[i].c_str(), feat);
+                }
+
+                ex.extract("out0", out_tile_gpu, cmd);
+            }
+
+            if (scale == 4)
+            {
+                ncnn::VkMat dummy_alpha;
+
+                std::vector<ncnn::VkMat> bindings(4);
+                bindings[0] = in_gpu;
+                bindings[1] = out_tile_gpu;
+                bindings[2] = dummy_alpha;
+                bindings[3] = out_gpu;
+
+                std::vector<ncnn::vk_constant_type> constants(16);
+                constants[0].i = in_gpu.w;
+                constants[1].i = in_gpu.h;
+                constants[2].i = in_gpu.cstep;
+                constants[3].i = out_tile_gpu.w;
+                constants[4].i = out_tile_gpu.h;
+                constants[5].i = out_tile_gpu.cstep;
+                constants[6].i = out_gpu.w;
+                constants[7].i = out_gpu.h;
+                constants[8].i = out_gpu.cstep;
+                constants[9].i = xi * TILE_SIZE_X;
+                constants[10].i = std::min(yi * TILE_SIZE_Y, prepadding);
+                constants[11].i = xi * TILE_SIZE_X * scale;
+                constants[12].i = std::min(TILE_SIZE_X * scale, out_gpu.w - xi * TILE_SIZE_X * scale);
+                constants[13].i = channels;
+                constants[14].i = 0;
+                constants[15].i = 0;
+
+                ncnn::VkMat dispatcher;
+                dispatcher.w = std::min(TILE_SIZE_X * scale, out_gpu.w - xi * TILE_SIZE_X * scale);
+                dispatcher.h = out_gpu.h;
+                dispatcher.c = channels;
+
+                cmd.record_pipeline(realcugan_4x_postproc, bindings, constants, dispatcher);
+            }
+            else
+            {
+                ncnn::VkMat dummy_alpha;
+
+                std::vector<ncnn::VkMat> bindings(3);
+                bindings[0] = out_tile_gpu;
+                bindings[1] = dummy_alpha;
+                bindings[2] = out_gpu;
+
+                std::vector<ncnn::vk_constant_type> constants(11);
+                constants[0].i = out_tile_gpu.w;
+                constants[1].i = out_tile_gpu.h;
+                constants[2].i = out_tile_gpu.cstep;
+                constants[3].i = out_gpu.w;
+                constants[4].i = out_gpu.h;
+                constants[5].i = out_gpu.cstep;
+                constants[6].i = xi * TILE_SIZE_X * scale;
+                constants[7].i = std::min(TILE_SIZE_X * scale, out_gpu.w - xi * TILE_SIZE_X * scale);
+                constants[8].i = channels;
+                constants[9].i = 0;
+                constants[10].i = 0;
+
+                ncnn::VkMat dispatcher;
+                dispatcher.w = std::min(TILE_SIZE_X * scale, out_gpu.w - xi * TILE_SIZE_X * scale);
+                dispatcher.h = out_gpu.h;
+                dispatcher.c = channels;
+
+                cmd.record_pipeline(realcugan_postproc, bindings, constants, dispatcher);
+            }
+
+            if (xtiles > 1)
+            {
+                cmd.submit_and_wait();
+                cmd.reset();
+            }
+
+            fprintf(stderr, "background upscale (syncgap pass 2) %.2f%%\n", (float)(yi * xtiles + xi) / (ytiles * xtiles) * 100);
+        }
+
+        {
+            unsigned char* out_row_ptr = outimage.data + (size_t)yi * scale * TILE_SIZE_Y * w * scale * channels;
+
+            ncnn::Mat out;
+            if (opt.use_fp16_storage && opt.use_int8_storage)
+            {
+                out = ncnn::Mat(out_gpu.w, out_gpu.h, (void*)out_row_ptr, (size_t)channels, 1);
+                cmd.record_clone(out_gpu, out, opt);
+                cmd.submit_and_wait();
+            }
+            else
+            {
+                cmd.record_clone(out_gpu, out, opt);
+                cmd.submit_and_wait();
+                out.to_pixels(out_row_ptr, ncnn::Mat::PIXEL_BGR);
+            }
+        }
+    }
 
     return 0;
 }
