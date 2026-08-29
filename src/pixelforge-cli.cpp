@@ -107,11 +107,13 @@ static void enable_ansi_colors() {
 }
 
 static void print_version() {
+    fprintf(stderr, "\n");
     fprintf(stderr, C_WHITE "  PixelForge " C_RESET C_YELLOW "v" PIXELFORGE_VERSION C_RESET "\n");
     fprintf(stderr, C_GRAY "  (formerly GFPGAN Auto Composite - face restore + RealESRGAN/RealCUGAN\n  background upscale + waifu2x denoise, all-in-one)\n" C_RESET);
     fprintf(stderr, C_GRAY "  build " C_RESET "%s" C_GRAY " (git " C_RESET "%s" C_GRAY ")" C_RESET "\n",
             PIXELFORGE_BUILD_DATE, PIXELFORGE_GIT_HASH);
     fprintf(stderr, C_GRAY "  features: " C_RESET "%s\n", PIXELFORGE_FEATURE_SUMMARY);
+    fprintf(stderr, "\n");
 }
 
 static void print_usage(const char *progname) {
