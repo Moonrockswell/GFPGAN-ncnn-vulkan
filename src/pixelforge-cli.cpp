@@ -65,15 +65,18 @@ namespace fs = std::filesystem;
 
 // Default folder (relative to the executable / current working directory)
 // where the .param / .bin model files are expected to be found.
-static const char *DEFAULT_MODEL_DIR = "./gfpgan-models";
+// v1.1부터 4개 엔진(gfpgan/realesrgan/realcugan/waifu2x) 모델 폴더를
+// "models/<엔진명>" 구조 하나로 통합함 (예전의 flat한 gfpgan-models,
+// realesrgan-models 등 개별 최상위 폴더 방식을 대체).
+static const char *DEFAULT_MODEL_DIR = "./models/gfpgan";
 // RealESRGAN(배경 업스케일) 모델은 GFPGAN(얼굴 보정) 모델과 별도 폴더에 둡니다.
 // 공식 realesrgan-ncnn-vulkan 배포본의 모델 파일명을 변형 없이 그대로 사용합니다.
-static const char *DEFAULT_REALESRGAN_MODEL_DIR = "./realesrgan-models";
-static const char *DEFAULT_REALCUGAN_MODEL_DIR = "./realcugan-models";
+static const char *DEFAULT_REALESRGAN_MODEL_DIR = "./models/realesrgan";
+static const char *DEFAULT_REALCUGAN_MODEL_DIR = "./models/realcugan";
 // waifu2x cunet 노이즈 제거(-nn) 모델도 별도 폴더. 공식 waifu2x-ncnn-vulkan
 // models-cunet 배포본의 noise{1,2,3}_model.param/.bin 파일명을 그대로 사용
 // (scale 접미사 없는 버전 - 배율은 안 바꾸고 노이즈만 제거).
-static const char *DEFAULT_WAIFU2X_MODEL_DIR = "./waifu2x-models";
+static const char *DEFAULT_WAIFU2X_MODEL_DIR = "./models/waifu2x";
 
 // ---------- ANSI 컬러 (gfpgan-auto-composite.bat 와 동일 팔레트) ----------
 // -h 출력에 색을 입히기 위한 매크로들입니다. 실제로 터미널에 반영되려면

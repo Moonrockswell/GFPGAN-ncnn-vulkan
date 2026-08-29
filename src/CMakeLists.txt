@@ -242,7 +242,7 @@ compile_shader(realcugan_postproc.comp)
 compile_shader(realcugan_4x_postproc.comp)
 add_custom_target(generate-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
 
-add_executable(pixelforge gfpgan-ncnn-vulkan-demo.cpp gfpgan.cpp face.cpp realesrgan.cpp waifu2x_denoise.cpp realcugan.cpp)
+add_executable(pixelforge pixelforge-cli.cpp gfpgan.cpp face.cpp realesrgan.cpp waifu2x_denoise.cpp realcugan.cpp)
 
 # Waifu2xDenoise(-nn) 클래스 단독 검증용 테스트 도구 (GFPGAN/RealESRGAN 모델 불필요)
 add_executable(test_waifu2x_denoise test_waifu2x_denoise.cpp waifu2x_denoise.cpp)
