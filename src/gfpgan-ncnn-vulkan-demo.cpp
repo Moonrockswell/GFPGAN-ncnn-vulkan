@@ -31,7 +31,7 @@
 #define PIXELFORGE_VERSION "1.0"
 // 이 exe에 실제로 들어있는 기능 요약 - 옛날 빌드로 착각해서 헤매는 걸 막기 위한 것이라,
 // 새 기능을 추가할 때마다 여기도 같이 갱신할 것.
-#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling"
+#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling+imread-retry"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -112,8 +112,9 @@ static void print_version() {
 }
 
 static void print_usage(const char *progname) {
+    // main()이 -h 파싱 전에 이미 print_version()을 한 번 찍었으므로, 여기서 또
+    // 부르면 배너가 두 번 중복 출력됨. 여기서는 부제목 한 줄만 추가로 보여준다.
     fprintf(stderr, C_CYAN "===========================================================\n" C_RESET);
-    print_version();
     fprintf(stderr, "  " C_GRAY "Face restore (GFPGAN) + background upscale (RealESRGAN/RealCUGAN)\n" C_RESET);
     fprintf(stderr, C_CYAN "===========================================================\n" C_RESET);
     fprintf(stderr, "\n");
@@ -121,6 +122,7 @@ static void print_usage(const char *progname) {
 
     // ---------------- I/O ----------------
     fprintf(stderr, C_CYAN "  [ I/O ]" C_RESET "\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "  " C_WHITE "-h" C_RESET "                      show this help\n");
     fprintf(stderr, "  " C_WHITE "-i" C_RESET " input-path           input image path (jpg/png/webp) or folder\n");
     fprintf(stderr, "  " C_WHITE "-o" C_RESET " output-path          output image path (jpg/png/webp) or folder\n");
@@ -134,6 +136,7 @@ static void print_usage(const char *progname) {
 
     // ---------------- MODELS / FORMAT / TILE ----------------
     fprintf(stderr, C_CYAN "  [ MODELS / OUTPUT ]" C_RESET "\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "  " C_WHITE "-m" C_RESET " model-path           folder path to the GFPGAN (face) models "
         C_GRAY "(default=%s)" C_RESET "\n", DEFAULT_MODEL_DIR);
     fprintf(stderr, "  " C_WHITE "-rm" C_RESET " model-path          folder path to the RealESRGAN (background) models "
@@ -172,18 +175,19 @@ static void print_usage(const char *progname) {
         C_GREEN "default=png" C_RESET ")\n");
     fprintf(stderr, "  " C_WHITE "-t" C_RESET " tile-size            background upscale tile-size, 0=no tiling "
         C_GREEN "(default = 300)" C_RESET "\n");
-    fprintf(stderr, "  " C_WHITE "-fp32" C_RESET " 0/1                fp16/int8 GPU 최적화 강제 끄기(1=끔), "
-        C_GREEN "(default=0)" C_RESET "\n");
-    fprintf(stderr, C_GRAY
-        "                          구형 GPU(예: Kepler 세대)에서 타일 결과가 깨질 때 진단용\n" C_RESET);
-    fprintf(stderr, "  " C_WHITE "-syncgap" C_RESET " 0/1             RealCUGAN 타일 경계 SE 게이트 동기화(1=켬), "
-        C_GREEN "(default=0)" C_RESET "\n");
-    fprintf(stderr, C_GRAY
-        "                          은은한 격자 얼룩 제거용, 처리 시간 약 2배로 늘어남\n"
-        "                          (RealESRGAN 모델 사용 시엔 무시됨)\n" C_RESET);
     fprintf(stderr, C_GRAY
         "                          smaller values reduce GPU memory load per step\n"
         "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-fp32" C_RESET " 0/1                force fp16/int8 GPU optimizations off (1=off), "
+        C_GREEN "(default=0)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
+        "                          diagnostic option for older GPUs (e.g. Kepler-gen) where tile\n"
+        "                          results come out corrupted\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-syncgap" C_RESET " 0/1             sync RealCUGAN's tile-boundary SE gate (1=on), "
+        C_GREEN "(default=0)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
+        "                          removes faint grid artifacts at tile borders, roughly doubles\n"
+        "                          processing time; ignored when a RealESRGAN model is in use\n" C_RESET);
     fprintf(stderr, "  " C_WHITE "-s" C_RESET " scale                final output scale relative to original: 1/2/3/4 "
         C_GREEN "(default = 2)" C_RESET "\n");
     fprintf(stderr, C_GRAY
@@ -277,6 +281,7 @@ static void print_usage(const char *progname) {
 
     // ---------------- PERFORMANCE ----------------
     fprintf(stderr, C_CYAN "  [ PERFORMANCE ]" C_RESET "\n");
+    fprintf(stderr, "\n");
     fprintf(stderr, "  " C_WHITE "-threads" C_RESET " N              limit CPU threads used by OpenCV post-processing (denoise,\n");
     fprintf(stderr, C_GRAY
         "                          CLAHE, scratch-removal, etc, default = -1 = unlimited); does NOT\n"
@@ -658,7 +663,21 @@ static bool restore_one_image(GFPGAN &gfpgan,
                                int denoiseStrength, int sharpenStrength, int claheStrength, int scale,
                                size_t maxFacesPerImage, int whiteBalance, int detailEnhanceStrength,
                                int vignetteStrength, int scratchStrength, int faceRestore) {
-    cv::Mat img = cv::imread(inputPath, 1);
+    // 방금 새로 생성/복사된 파일은 백신/실시간 보호 프로그램(Windows Defender,
+    // Advanced SystemCare 등)이 짧게 스캔하느라 아주 잠깐 잠그는 경우가 있어서,
+    // 그 타이밍에 걸리면 실제로는 멀쩡한 파일인데도 cv::imread가 실패합니다.
+    // 최대 3번, 사이에 짧게 대기하며 재시도해서 이런 일시적 실패를 흡수합니다.
+    cv::Mat img;
+    const int kMaxImreadAttempts = 3;
+    for (int attempt = 1; attempt <= kMaxImreadAttempts; attempt++) {
+        img = cv::imread(inputPath, 1);
+        if (!img.empty()) break;
+        if (attempt < kMaxImreadAttempts) {
+            fprintf(stderr, "  (retry %d/%d) cv::imread %s returned empty, retrying shortly - possibly locked by antivirus/real-time scan\n",
+                    attempt, kMaxImreadAttempts - 1, inputPath.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
     if (img.empty()) {
         fprintf(stderr, "cv::imread %s failed\n", inputPath.c_str());
         return false;
@@ -1219,8 +1238,11 @@ int main(int argc, char **argv) {
         }
 
         int processed = 0;
+        int attempted = 0;  // 확장자가 맞아서 실제로 시도된 파일 수 (실패 포함) - "파일이
+                            // 아예 없음"과 "찾았지만 전부 실패함"을 구분하기 위함
         for (const auto &entry : fs::directory_iterator(imagepath)) {
             if (!is_image_file(entry.path())) continue;
+            attempted++;
 
             std::string outExt = !format.empty() ? to_lower(format) : "png";
             std::string outName = entry.path().stem().string() + "." + outExt;
@@ -1244,8 +1266,13 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (processed == 0) {
+        if (attempted == 0) {
             fprintf(stderr, "No jpg/png/webp images found in '%s'\n", imagepath.c_str());
+            return -1;
+        }
+        if (processed == 0) {
+            fprintf(stderr, "Found %d jpg/png/webp image(s) in '%s' but every one failed to process - see the errors above.\n",
+                    attempted, imagepath.c_str());
             return -1;
         }
         fprintf(stderr, "Done. %d image(s) saved to %s\n", processed, outDir.c_str());
