@@ -1,7 +1,29 @@
 cmake_minimum_required(VERSION 3.12)
-project(gfpgan-ncnn-vulkan)
+project(pixelforge)
 
 set(CMAKE_BUILD_TYPE Release)
+
+# -------------- 빌드 버전 정보 (콘솔 배너/-h에 표시, 구버전 exe 혼동 방지용) --------------#
+# git 커밋 해시를 구성 시점에 잡아둠. git이 없거나 .git이 없는 환경(예: 소스만 압축해서
+# 받은 경우)에서도 빌드가 실패하지 않도록 실패 시 "unknown"으로 대체.
+find_package(Git QUIET)
+if (GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE PIXELFORGE_GIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE PIXELFORGE_GIT_RESULT
+    )
+endif ()
+if (NOT PIXELFORGE_GIT_HASH OR PIXELFORGE_GIT_RESULT)
+    set(PIXELFORGE_GIT_HASH "unknown")
+endif ()
+string(TIMESTAMP PIXELFORGE_BUILD_DATE "%Y-%m-%d %H:%M UTC" UTC)
+message(STATUS "PixelForge build version: git=${PIXELFORGE_GIT_HASH} date=${PIXELFORGE_BUILD_DATE}")
+add_compile_definitions(PIXELFORGE_GIT_HASH="${PIXELFORGE_GIT_HASH}")
+add_compile_definitions(PIXELFORGE_BUILD_DATE="${PIXELFORGE_BUILD_DATE}")
 
 # -------------- Support C++17 for using filesystem  ------------------#
 # https://cmake.org/cmake/help/latest/prop_tgt/CXX_STANDARD.html
@@ -220,16 +242,16 @@ compile_shader(realcugan_postproc.comp)
 compile_shader(realcugan_4x_postproc.comp)
 add_custom_target(generate-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
 
-add_executable(gfpgan-ncnn-vulkan gfpgan-ncnn-vulkan-demo.cpp gfpgan.cpp face.cpp realesrgan.cpp waifu2x_denoise.cpp realcugan.cpp)
+add_executable(pixelforge gfpgan-ncnn-vulkan-demo.cpp gfpgan.cpp face.cpp realesrgan.cpp waifu2x_denoise.cpp realcugan.cpp)
 
 # Waifu2xDenoise(-nn) 클래스 단독 검증용 테스트 도구 (GFPGAN/RealESRGAN 모델 불필요)
 add_executable(test_waifu2x_denoise test_waifu2x_denoise.cpp waifu2x_denoise.cpp)
-add_dependencies(gfpgan-ncnn-vulkan generate-spirv)
-target_link_libraries(gfpgan-ncnn-vulkan ${NCNN_GFPGAN_LINK_LIBRARIES} ${OpenCV_LIBS})
+add_dependencies(pixelforge generate-spirv)
+target_link_libraries(pixelforge ${NCNN_GFPGAN_LINK_LIBRARIES} ${OpenCV_LIBS})
 target_link_libraries(test_waifu2x_denoise ${NCNN_GFPGAN_LINK_LIBRARIES} ${OpenCV_LIBS})
 
 if (HAVE_XPHOTO_HEADER)
-    target_compile_definitions(gfpgan-ncnn-vulkan PRIVATE HAVE_XPHOTO=1)
+    target_compile_definitions(pixelforge PRIVATE HAVE_XPHOTO=1)
 else ()
-    target_compile_definitions(gfpgan-ncnn-vulkan PRIVATE HAVE_XPHOTO=0)
+    target_compile_definitions(pixelforge PRIVATE HAVE_XPHOTO=0)
 endif ()

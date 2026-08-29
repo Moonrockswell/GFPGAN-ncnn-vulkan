@@ -17,6 +17,22 @@
 #include "background_upscaler.h"
 #include "waifu2x_denoise.h"
 
+// CMakeLists.txt가 구성 시점에 git 커밋 해시/빌드 날짜를 넣어줌. CMake를 안 거치고
+// 이 파일 하나만 다른 방식으로 컴파일하는 경우를 위한 안전한 기본값(폴백).
+#ifndef PIXELFORGE_GIT_HASH
+#define PIXELFORGE_GIT_HASH "unknown"
+#endif
+#ifndef PIXELFORGE_BUILD_DATE
+#define PIXELFORGE_BUILD_DATE __DATE__ " " __TIME__
+#endif
+// 제품 버전(사람이 직접 관리) - RealESRGAN+RealCUGAN+waifu2x+GFPGAN 4개 엔진이
+// 전부 통합된 시점을 1.0으로 확정함. 이후 기능이 크게 늘거나 호환성이 깨지는
+// 변경이 있을 때만 사람이 직접 올릴 것 (git 해시/빌드 날짜처럼 자동 갱신 아님).
+#define PIXELFORGE_VERSION "1.0"
+// 이 exe에 실제로 들어있는 기능 요약 - 옛날 빌드로 착각해서 헤매는 걸 막기 위한 것이라,
+// 새 기능을 추가할 때마다 여기도 같이 갱신할 것.
+#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling"
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -87,10 +103,18 @@ static void enable_ansi_colors() {
 #endif
 }
 
+static void print_version() {
+    fprintf(stderr, C_WHITE "  PixelForge " C_RESET C_YELLOW "v" PIXELFORGE_VERSION C_RESET "\n");
+    fprintf(stderr, C_GRAY "  (formerly GFPGAN Auto Composite - face restore + RealESRGAN/RealCUGAN\n  background upscale + waifu2x denoise, all-in-one)\n" C_RESET);
+    fprintf(stderr, C_GRAY "  build " C_RESET "%s" C_GRAY " (git " C_RESET "%s" C_GRAY ")" C_RESET "\n",
+            PIXELFORGE_BUILD_DATE, PIXELFORGE_GIT_HASH);
+    fprintf(stderr, C_GRAY "  features: " C_RESET "%s\n", PIXELFORGE_FEATURE_SUMMARY);
+}
+
 static void print_usage(const char *progname) {
     fprintf(stderr, C_CYAN "===========================================================\n" C_RESET);
-    fprintf(stderr, "  " C_CYAN "GFPGAN Auto Composite" C_RESET "\n");
-    fprintf(stderr, "  " C_GRAY "Face restore (GFPGAN) + background upscale (RealESRGAN)\n" C_RESET);
+    print_version();
+    fprintf(stderr, "  " C_GRAY "Face restore (GFPGAN) + background upscale (RealESRGAN/RealCUGAN)\n" C_RESET);
     fprintf(stderr, C_CYAN "===========================================================\n" C_RESET);
     fprintf(stderr, "\n");
     fprintf(stderr, "  " C_WHITE "Usage:" C_RESET " %s -i infile -o outfile [options]\n\n", progname);
@@ -783,6 +807,8 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
 int main(int argc, char **argv) {
     enable_ansi_colors();  // Windows 콘솔에서 -h 출력 색상이 보이도록 VT100 처리를 켠다
+    print_version();  // 매 실행마다 항상 찍음 - 구버전 exe를 새 버전으로 착각해서
+                       // 헤매는 일을 막기 위함(스크린샷 한 장으로 바로 확인 가능)
 
     std::string imagepath;
     std::string outputpath;
