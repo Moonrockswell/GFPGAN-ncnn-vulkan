@@ -148,6 +148,7 @@ int RealCUGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 
 int RealCUGAN::tile_process_plain(const cv::Mat& inimage, cv::Mat& outimage)
 {
+    bool gpu_submit_failed = false;
     // 이 프로젝트는 항상 3채널 BGR(cv::imread(..., 1))만 다룹니다.
     const int channels = 3;
     const int w = inimage.cols;
@@ -219,7 +220,7 @@ int RealCUGAN::tile_process_plain(const cv::Mat& inimage, cv::Mat& outimage)
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
         }
@@ -371,7 +372,7 @@ int RealCUGAN::tile_process_plain(const cv::Mat& inimage, cv::Mat& outimage)
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
 
@@ -387,12 +388,12 @@ int RealCUGAN::tile_process_plain(const cv::Mat& inimage, cv::Mat& outimage)
             {
                 out = ncnn::Mat(out_gpu.w, out_gpu.h, (void*)out_row_ptr, (size_t)channels, 1);
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
             }
             else
             {
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 out.to_pixels(out_row_ptr, ncnn::Mat::PIXEL_BGR);
             }
         }
@@ -401,7 +402,7 @@ int RealCUGAN::tile_process_plain(const cv::Mat& inimage, cv::Mat& outimage)
     net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
     net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
 
-    return 0;
+    return gpu_submit_failed ? -1 : 0;
 }
 
 // ===========================================================================
@@ -461,6 +462,7 @@ int RealCUGAN::syncgap_stage0(const cv::Mat& inimage, const std::vector<std::str
                                const ncnn::Option& opt, ncnn::VkAllocator* blob_vkallocator,
                                ncnn::VkAllocator* staging_vkallocator, FeatureCache& cache)
 {
+    bool gpu_submit_failed = false;
     const int channels = 3;
     const int w = inimage.cols;
     const int h = inimage.rows;
@@ -516,7 +518,7 @@ int RealCUGAN::syncgap_stage0(const cv::Mat& inimage, const std::vector<std::str
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
         }
@@ -592,21 +594,22 @@ int RealCUGAN::syncgap_stage0(const cv::Mat& inimage, const std::vector<std::str
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
         }
 
-        cmd.submit_and_wait();
+        if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
         cmd.reset();
     }
 
-    return 0;
+    return gpu_submit_failed ? -1 : 0;
 }
 
 int RealCUGAN::syncgap_sync(const std::vector<std::string>& names, const ncnn::Option& opt,
                              int xtiles, int ytiles, FeatureCache& cache)
 {
+    bool gpu_submit_failed = false;
     std::vector<std::vector<ncnn::VkMat> > feats(names.size());
     for (int yi = 0; yi < ytiles; yi++)
     {
@@ -635,7 +638,7 @@ int RealCUGAN::syncgap_sync(const std::vector<std::string>& names, const ncnn::O
             cmd.record_download(feats[i][j], feats_cpu[i][j], opt);
         }
     }
-    cmd.submit_and_wait();
+    if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
     cmd.reset();
 
     // 전체 평균 -> 다시 업로드
@@ -672,7 +675,7 @@ int RealCUGAN::syncgap_sync(const std::vector<std::string>& names, const ncnn::O
 
         cmd.record_upload(avgfeat, avgfeats[i], opt);
     }
-    cmd.submit_and_wait();
+    if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
     cmd.reset();
 
     // 모든 타일 위치에 같은(동기화된) 값을 다시 저장
@@ -687,7 +690,7 @@ int RealCUGAN::syncgap_sync(const std::vector<std::string>& names, const ncnn::O
         }
     }
 
-    return 0;
+    return gpu_submit_failed ? -1 : 0;
 }
 
 int RealCUGAN::syncgap_stage2(const cv::Mat& inimage, const std::vector<std::string>& names,
@@ -695,6 +698,7 @@ int RealCUGAN::syncgap_stage2(const cv::Mat& inimage, const std::vector<std::str
                                ncnn::VkAllocator* blob_vkallocator, ncnn::VkAllocator* staging_vkallocator,
                                FeatureCache& cache)
 {
+    bool gpu_submit_failed = false;
     const int channels = 3;
     const int w = inimage.cols;
     const int h = inimage.rows;
@@ -752,7 +756,7 @@ int RealCUGAN::syncgap_stage2(const cv::Mat& inimage, const std::vector<std::str
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
         }
@@ -912,7 +916,7 @@ int RealCUGAN::syncgap_stage2(const cv::Mat& inimage, const std::vector<std::str
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
 
@@ -927,16 +931,16 @@ int RealCUGAN::syncgap_stage2(const cv::Mat& inimage, const std::vector<std::str
             {
                 out = ncnn::Mat(out_gpu.w, out_gpu.h, (void*)out_row_ptr, (size_t)channels, 1);
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
             }
             else
             {
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 out.to_pixels(out_row_ptr, ncnn::Mat::PIXEL_BGR);
             }
         }
     }
 
-    return 0;
+    return gpu_submit_failed ? -1 : 0;
 }

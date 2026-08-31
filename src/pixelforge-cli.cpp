@@ -31,7 +31,7 @@
 #define PIXELFORGE_VERSION "1.0"
 // 이 exe에 실제로 들어있는 기능 요약 - 옛날 빌드로 착각해서 헤매는 걸 막기 위한 것이라,
 // 새 기능을 추가할 때마다 여기도 같이 갱신할 것.
-#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling+imread-retry+cli-validation"
+#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling+imread-retry+cli-validation+gpu-fail-detect"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -694,7 +694,11 @@ static bool restore_one_image(GFPGAN &gfpgan,
     // waifu2x_denoise가 nullptr이면(-nn 0, 기본값) 완전히 건너뜁니다.
     if (waifu2x_denoise != nullptr) {
         cv::Mat denoised;
-        waifu2x_denoise->tile_process(img, denoised);
+        if (waifu2x_denoise->tile_process(img, denoised) != 0) {
+            fprintf(stderr, "Error: waifu2x AI denoise GPU processing failed for %s "
+                             "(likely a driver/VRAM issue) - skipping this image\n", inputPath.c_str());
+            return false;
+        }
         img = denoised;
     }
 
@@ -707,7 +711,11 @@ static bool restore_one_image(GFPGAN &gfpgan,
 
 #if RESTORE_WHOLE_IMAGE
     cv::Mat bg_upsample;
-    bg_upscaler.tile_process(img, bg_upsample);
+    if (bg_upscaler.tile_process(img, bg_upsample) != 0) {
+        fprintf(stderr, "Error: background upscale GPU processing failed for %s "
+                         "(likely a driver/VRAM issue - try a lower -t tile-size) - skipping this image\n", inputPath.c_str());
+        return false;
+    }
 
     // 얼굴이 실제로 합성되는 영역을 누적할 마스크. 스크래치 제거(-sr)가
     // 이 영역은 절대 건드리지 않고 배경에만 적용되도록 하는 데 씁니다.

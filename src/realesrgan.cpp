@@ -133,6 +133,7 @@ int RealESRGAN::load(const std::string& parampath, const std::string& modelpath)
 
 int RealESRGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 {
+    bool gpu_submit_failed = false;
     // 이 프로젝트는 항상 3채널 BGR(cv::imread(..., 1))만 다룹니다.
     const int channels = 3;
     const int w = inimage.cols;
@@ -191,7 +192,7 @@ int RealESRGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
         }
@@ -298,7 +299,7 @@ int RealESRGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
 
@@ -314,12 +315,12 @@ int RealESRGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
             {
                 out = ncnn::Mat(out_gpu.w, out_gpu.h, (void*)out_row_ptr, (size_t)channels, 1);
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
             }
             else
             {
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 out.to_pixels(out_row_ptr, ncnn::Mat::PIXEL_BGR);
             }
         }
@@ -328,5 +329,5 @@ int RealESRGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
     net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
     net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
 
-    return 0;
+    return gpu_submit_failed ? -1 : 0;
 }

@@ -115,6 +115,7 @@ int Waifu2xDenoise::load(const std::string& parampath, const std::string& modelp
 
 int Waifu2xDenoise::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 {
+    bool gpu_submit_failed = false;
     // RealESRGAN::tile_process와 거의 동일하되, scale이 항상 1이라 출력
     // 크기가 입력과 같고(outimage.create(h, w, ...)), prepadding 값과
     // 셰이더 파이프라인/블롭 이름만 다릅니다.
@@ -182,7 +183,7 @@ int Waifu2xDenoise::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
         }
@@ -300,7 +301,7 @@ int Waifu2xDenoise::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
 
             if (xtiles > 1)
             {
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
             }
 
@@ -316,12 +317,12 @@ int Waifu2xDenoise::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
             {
                 out = ncnn::Mat(out_gpu.w, out_gpu.h, (void*)out_row_ptr, (size_t)channels, 1);
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
             }
             else
             {
                 cmd.record_clone(out_gpu, out, opt);
-                cmd.submit_and_wait();
+                if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 out.to_pixels(out_row_ptr, ncnn::Mat::PIXEL_BGR);
             }
         }
@@ -330,5 +331,5 @@ int Waifu2xDenoise::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
     net.vulkan_device()->reclaim_blob_allocator(blob_vkallocator);
     net.vulkan_device()->reclaim_staging_allocator(staging_vkallocator);
 
-    return 0;
+    return gpu_submit_failed ? -1 : 0;
 }
