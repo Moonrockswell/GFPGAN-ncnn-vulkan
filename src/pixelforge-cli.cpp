@@ -31,7 +31,7 @@
 #define PIXELFORGE_VERSION "1.0"
 // 이 exe에 실제로 들어있는 기능 요약 - 옛날 빌드로 착각해서 헤매는 걸 막기 위한 것이라,
 // 새 기능을 추가할 때마다 여기도 같이 갱신할 것.
-#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling+imread-retry"
+#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling+imread-retry+cli-validation"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -848,6 +848,9 @@ int main(int argc, char **argv) {
     // 구형 GPU(fp16/int8 storage buffer 확장 미지원 또는 드라이버 버그)에서
     // 타일 결과가 깨질 때 fp32 경로로 강제 전환해 확인할 수 있는 진단용 옵션.
     // 기본값 false(기존 동작인 fp16/int8 최적화 사용) 유지.
+    // int로 먼저 받아 0/1 검증한 뒤 bool로 씀 (bool로 바로 받으면 "5"/"abc" 같은
+    // 값도 !=0 판정으로 조용히 true가 되어버려서 검증이 불가능해짐).
+    int fp32OnlyValue = 0;
     bool fp32Only = false;
     // RealCUGAN 전용 - 켜면 타일 경계의 SE(Squeeze-Excitation) 게이트를
     // 전체 이미지 기준으로 동기화해서 은은한 격자 얼룩을 없앰. 신경망을
@@ -903,7 +906,7 @@ int main(int argc, char **argv) {
         } else if (arg == "-t" && i + 1 < argc) {
             tilesize = std::atoi(argv[++i]);
         } else if (arg == "-fp32" && i + 1 < argc) {
-            fp32Only = std::atoi(argv[++i]) != 0;
+            fp32OnlyValue = std::atoi(argv[++i]);
         } else if (arg == "-syncgap" && i + 1 < argc) {
             syncGap = std::atoi(argv[++i]);
         } else if (arg == "-dn" && i + 1 < argc) {
@@ -1077,6 +1080,26 @@ int main(int argc, char **argv) {
 
     if (delayMs < 0) {
         fprintf(stderr, "Error: -delay-ms must be 0 or a positive integer (got '%d')\n\n", delayMs);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (cpuThreads < -1) {
+        fprintf(stderr, "Error: -threads must be -1 (unlimited, default), 0 (disable threading), "
+                         "or a positive integer (got '%d')\n\n", cpuThreads);
+        print_usage(argv[0]);
+        return -1;
+    }
+
+    if (fp32OnlyValue != 0 && fp32OnlyValue != 1) {
+        fprintf(stderr, "Error: -fp32 must be 0 (off, default) or 1 (on) (got '%d')\n\n", fp32OnlyValue);
+        print_usage(argv[0]);
+        return -1;
+    }
+    fp32Only = (fp32OnlyValue == 1);
+
+    if (syncGap != 0 && syncGap != 1) {
+        fprintf(stderr, "Error: -syncgap must be 0 (off, default) or 1 (on) (got '%d')\n\n", syncGap);
         print_usage(argv[0]);
         return -1;
     }
