@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 static const uint32_t waifu2x_preproc_spv_data[] = {
     #include "waifu2x_preproc.spv.hex.h"
@@ -55,6 +57,7 @@ Waifu2xDenoise::Waifu2xDenoise(int gpuid, bool force_fp32)
     // -nn CLI 파싱 쪽(gfpgan-ncnn-vulkan-demo.cpp)에서 모델 로드 직후
     // 다시 설정하지만, 안전한 기본값을 둡니다.
     tile_size = 400;
+    tile_delay_ms = 0;
     prepadding = 28; // cunet, scale=1(노이즈 전용) 케이스의 공식 기본값
 }
 
@@ -306,6 +309,11 @@ int Waifu2xDenoise::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
             }
 
             fprintf(stderr, "ai denoise %.2f%%\n", (float)(yi * xtiles + xi) / (ytiles * xtiles) * 100);
+
+            if (tile_delay_ms > 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(tile_delay_ms));
+            }
         }
 
         // 다운로드: out_gpu -> outimage의 해당 행 구간

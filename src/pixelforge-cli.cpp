@@ -31,7 +31,7 @@
 #define PIXELFORGE_VERSION "1.0"
 // 이 exe에 실제로 들어있는 기능 요약 - 옛날 빌드로 착각해서 헤매는 걸 막기 위한 것이라,
 // 새 기능을 추가할 때마다 여기도 같이 갱신할 것.
-#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling+imread-retry+cli-validation+gpu-fail-detect"
+#define PIXELFORGE_FEATURE_SUMMARY "RealESRGAN+RealCUGAN(6 models)+syncgap+waifu2x+fp32diag+TDR-safe-tiling+imread-retry+cli-validation+gpu-fail-detect+tiledelay"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -183,6 +183,12 @@ static void print_usage(const char *progname) {
     fprintf(stderr, C_GRAY
         "                          smaller values reduce GPU memory load per step\n"
         "                          useful to avoid GPU timeouts (Vulkan device lost) on older GPUs\n" C_RESET);
+    fprintf(stderr, "  " C_WHITE "-tiledelay" C_RESET " ms            pause this many ms after every tile "
+        C_GREEN "(default = 0)" C_RESET "\n");
+    fprintf(stderr, C_GRAY
+        "                          gives the GPU scheduler room to interleave other apps' GPU work;\n"
+        "                          CPU process-priority tools don't affect GPU scheduling at all, so\n"
+        "                          this is the actual lever if the system feels sluggish while processing\n" C_RESET);
     fprintf(stderr, "  " C_WHITE "-fp32" C_RESET " 0/1                force fp16/int8 GPU optimizations off (1=off), "
         C_GREEN "(default=0)" C_RESET "\n");
     fprintf(stderr, C_GRAY
@@ -853,6 +859,11 @@ int main(int argc, char **argv) {
     bool realesrganModelNameExplicit = false;  // 사용자가 -rn 을 직접 지정했는지 여부
     std::string format;
     int tilesize = 400;  // background upscale tile size, overridable via -t
+    // 타일 하나 끝날 때마다 이만큼(ms) 쉬어서 GPU에 다른 프로그램이 끼어들
+    // 틈을 줌. Process Priority(-priority)는 CPU 스케줄링만 건드리고 GPU
+    // 자체 점유율에는 영향이 없어서, "GPU 작업 중 다른 프로그램이 버벅인다"는
+    // 문제는 이 옵션이 실질적으로 도움이 됨. 기본값 0(안 쉼, 기존 동작 유지).
+    int tileDelayMs = 0;
     // 구형 GPU(fp16/int8 storage buffer 확장 미지원 또는 드라이버 버그)에서
     // 타일 결과가 깨질 때 fp32 경로로 강제 전환해 확인할 수 있는 진단용 옵션.
     // 기본값 false(기존 동작인 fp16/int8 최적화 사용) 유지.
@@ -913,6 +924,8 @@ int main(int argc, char **argv) {
             format = argv[++i];
         } else if (arg == "-t" && i + 1 < argc) {
             tilesize = std::atoi(argv[++i]);
+        } else if (arg == "-tiledelay" && i + 1 < argc) {
+            tileDelayMs = std::atoi(argv[++i]);
         } else if (arg == "-fp32" && i + 1 < argc) {
             fp32OnlyValue = std::atoi(argv[++i]);
         } else if (arg == "-syncgap" && i + 1 < argc) {
@@ -1092,6 +1105,12 @@ int main(int argc, char **argv) {
         return -1;
     }
 
+    if (tileDelayMs < 0) {
+        fprintf(stderr, "Error: -tiledelay must be 0 (off, default) or a positive integer (got '%d')\n\n", tileDelayMs);
+        print_usage(argv[0]);
+        return -1;
+    }
+
     if (cpuThreads < -1) {
         fprintf(stderr, "Error: -threads must be -1 (unlimited, default), 0 (disable threading), "
                          "or a positive integer (got '%d')\n\n", cpuThreads);
@@ -1205,6 +1224,7 @@ int main(int argc, char **argv) {
         else if (cuganScale == 3) real_cugan.tile_pad = 14;
         else real_cugan.tile_pad = 19; // cuganScale == 4
         real_cugan.syncgap = syncGap;
+        real_cugan.tile_delay_ms = tileDelayMs;
     } else {
         std::string realesrganParam, realesrganModel;
         int esrganScale;
@@ -1236,6 +1256,7 @@ int main(int argc, char **argv) {
         bg_upscaler.set_backend(&real_esrgan);
         bg_upscaler.set_scale(esrganScale);
         bg_upscaler.set_tile_size(tilesize);
+        real_esrgan.tile_delay_ms = tileDelayMs;
     }
 #endif
 
@@ -1257,6 +1278,7 @@ int main(int argc, char **argv) {
         // RealESRGAN과 같은 -t 값을 공유(간단하게 시작; 문제가 생기면 나중에
         // -nn 전용 타일 크기 옵션으로 분리 가능).
         waifu2x_denoise->tile_size = tilesize;
+        waifu2x_denoise->tile_delay_ms = tileDelayMs;
     }
 
     bool inputIsDir = fs::is_directory(imagepath);

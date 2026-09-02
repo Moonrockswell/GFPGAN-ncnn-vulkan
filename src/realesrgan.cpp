@@ -27,6 +27,8 @@
 
 #include <algorithm>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 static const uint32_t realesrgan_preproc_spv_data[] = {
     #include "realesrgan_preproc.spv.hex.h"
@@ -71,6 +73,7 @@ RealESRGAN::RealESRGAN(int gpuid, bool _tta_mode, bool force_fp32)
     scale = 4;
     tile_size = 400;
     tile_pad = 10;
+    tile_delay_ms = 0;
 }
 
 RealESRGAN::~RealESRGAN()
@@ -304,6 +307,11 @@ int RealESRGAN::tile_process(const cv::Mat& inimage, cv::Mat& outimage)
             }
 
             fprintf(stderr, "background upscale %.2f%%\n", (float)(yi * xtiles + xi) / (ytiles * xtiles) * 100);
+
+            if (tile_delay_ms > 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(tile_delay_ms));
+            }
         }
 
         // 다운로드: out_gpu -> outimage의 해당 행 구간

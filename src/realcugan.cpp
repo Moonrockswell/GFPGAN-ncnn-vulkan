@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 static const uint32_t realcugan_preproc_spv_data[] = {
     #include "realcugan_preproc.spv.hex.h"
@@ -74,6 +76,7 @@ RealCUGAN::RealCUGAN(int gpuid, bool force_fp32)
     scale = 2;
     tile_size = 400;
     tile_pad = 10;
+    tile_delay_ms = 0;
     syncgap = 0;
 }
 
@@ -377,6 +380,11 @@ int RealCUGAN::tile_process_plain(const cv::Mat& inimage, cv::Mat& outimage)
             }
 
             fprintf(stderr, "background upscale %.2f%%\n", (float)(yi * xtiles + xi) / (ytiles * xtiles) * 100);
+
+            if (tile_delay_ms > 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(tile_delay_ms));
+            }
         }
 
         // 다운로드: out_gpu -> outimage의 해당 행 구간
@@ -596,6 +604,11 @@ int RealCUGAN::syncgap_stage0(const cv::Mat& inimage, const std::vector<std::str
             {
                 if (cmd.submit_and_wait() != 0) { fprintf(stderr, "Error: GPU command submission failed - tile result may be corrupted or blank\n"); gpu_submit_failed = true; }
                 cmd.reset();
+            }
+
+            if (tile_delay_ms > 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(tile_delay_ms));
             }
         }
 
@@ -921,6 +934,11 @@ int RealCUGAN::syncgap_stage2(const cv::Mat& inimage, const std::vector<std::str
             }
 
             fprintf(stderr, "background upscale (syncgap pass 2) %.2f%%\n", (float)(yi * xtiles + xi) / (ytiles * xtiles) * 100);
+
+            if (tile_delay_ms > 0)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(tile_delay_ms));
+            }
         }
 
         {
