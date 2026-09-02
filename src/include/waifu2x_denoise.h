@@ -42,6 +42,7 @@ public:
     int prepadding;  // RealESRGAN::tile_pad와 동일한 역할.
                       // waifu2x-ncnn-vulkan 공식 배포판의 cunet, scale=1(노이즈 전용)
                       // 케이스 공식 기본값 = 28 (main.cpp의 prepadding 결정 로직 참고)
+    int tile_delay_ms;  // RealESRGAN과 동일한 의미(-tiledelay 옵션)
 
 private:
     ncnn::Net net;

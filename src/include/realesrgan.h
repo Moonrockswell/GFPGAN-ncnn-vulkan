@@ -38,6 +38,9 @@ public:
     int scale;
     int tile_size;   // 예전 이름 유지 (내부적으로 GPU 타일 한 변의 크기로 사용)
     int tile_pad;    // 예전 이름 유지 (내부적으로 prepadding으로 사용)
+    int tile_delay_ms;  // 0=기본(안 쉼). 타일 하나 끝날 때마다 이만큼 쉬어서 GPU가
+                         // 숨 돌릴 틈을 줌 - 처리 중 다른 프로그램 GPU 사용이 버벅이는
+                         // 것을 완화하는 용도(-tiledelay 옵션).
 
 private:
     ncnn::Net net;

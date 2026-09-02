@@ -50,6 +50,7 @@ public:
     int scale;       // 2, 3, 4 중 하나 (로드한 모델 파일에 맞게 호출부에서 설정)
     int tile_size;   // RealESRGAN과 동일한 이름 컨벤션
     int tile_pad;    // RealESRGAN과 동일한 이름 컨벤션 (내부적으로 prepadding으로 사용)
+    int tile_delay_ms;  // RealESRGAN과 동일한 의미(-tiledelay 옵션)
     // 0(기본)=끔, 1=켬("rough" 버전). 타일 경계에서 SE(Squeeze-Excitation)
     // 레이어가 타일마다 따로 계산되면서 생기는 은은한 격자 얼룩을 없애줍니다.
     // 공식 구현의 4단계 순차 동기화(syncgap=1, 최고 품질) 대신, 한 번에
