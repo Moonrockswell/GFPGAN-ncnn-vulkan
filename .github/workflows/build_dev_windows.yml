@@ -65,8 +65,8 @@ jobs:
         $exe = "build\Release\pixelforge.exe"
         $failed = $false
 
-        function Check-Case($name, $args, $expectSuccess, $expectedText) {
-          $output = & $exe @args 2>&1 | Out-String
+        function Check-Case($name, $cliArgs, $expectSuccess, $expectedText) {
+          $output = & $exe @cliArgs 2>&1 | Out-String
           $code = $LASTEXITCODE
           $ok = if ($expectSuccess) { $code -eq 0 } else { $code -ne 0 }
           $textOk = if ($expectedText) { $output -match [regex]::Escape($expectedText) } else { $true }
