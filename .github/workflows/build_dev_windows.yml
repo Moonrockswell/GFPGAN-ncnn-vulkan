@@ -54,6 +54,53 @@ jobs:
     - name: copy dependencies
       run: |
         Copy-Item (Get-ChildItem -Path OpenCV -Recurse -Filter "opencv_world*.dll").FullName -Destination "build\Release\"
+    - name: smoke test
+      # windows-latest 러너에는 실제 GPU가 없어서 진짜 이미지 변환(GPU 연산)까지는
+      # 여기서 검증 못 함. 대신 GPU 초기화보다 먼저 실행되는 두 가지 - (1) -h가
+      # 정상적으로 뜨는지 (2) 이번에 추가한 CLI 입력값 검증들이 실제로 잘못된
+      # 값을 거부하는지 - 는 실제 GPU 없이도 확인 가능해서 여기서 잡는다.
+      # 이 스텝이 실패하면 산출물이 업로드되지 않는다(아래 upload artifact 이전).
+      shell: pwsh
+      run: |
+        $exe = "build\Release\pixelforge.exe"
+        $failed = $false
+
+        function Check-Case($name, $args, $expectSuccess, $expectedText) {
+          $output = & $exe @args 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          $ok = if ($expectSuccess) { $code -eq 0 } else { $code -ne 0 }
+          $textOk = if ($expectedText) { $output -match [regex]::Escape($expectedText) } else { $true }
+          if ($ok -and $textOk) {
+            Write-Host "[PASS] $name"
+          } else {
+            Write-Host "[FAIL] $name (exit=$code, expected success=$expectSuccess, expected text='$expectedText')"
+            Write-Host "----- output -----"
+            Write-Host $output
+            Write-Host "------------------"
+            $script:failed = $true
+          }
+        }
+
+        # -h는 GPU를 건드리기 전에 처리되고 exit 0으로 끝나야 함
+        Check-Case "-h shows help and exits 0" @("-h") $true "PixelForge"
+        Check-Case "-h shows feature summary" @("-h") $true "features:"
+
+        # -i 없이 실행하면 명확한 에러로 즉시 실패해야 함(조용히 아무것도 안 하고 끝나면 안 됨)
+        Check-Case "no args requires -i" @() $false "-i input-path is required"
+
+        # 아래는 실제 파일이 없어도(더미 경로) 도달하는 순수 인자 검증 단계라
+        # GPU/이미지 없이도 확인 가능함 - 이번 CLI 검증 일관성 작업으로 새로 추가된 것들
+        Check-Case "-fp32 rejects out-of-range value" @("-i", "dummy.jpg", "-fp32", "5") $false "-fp32 must be 0"
+        Check-Case "-syncgap rejects out-of-range value" @("-i", "dummy.jpg", "-syncgap", "5") $false "-syncgap must be 0"
+        Check-Case "-threads rejects invalid value" @("-i", "dummy.jpg", "-threads", "-5") $false "-threads must be"
+        Check-Case "-tiledelay rejects negative value" @("-i", "dummy.jpg", "-tiledelay", "-5") $false "-tiledelay must be"
+        Check-Case "-rn rejects unknown model name" @("-i", "dummy.jpg", "-rn", "not-a-real-model") $false "-rn model-name must be one of"
+
+        if ($failed) {
+          Write-Host "One or more smoke tests failed - see [FAIL] lines above."
+          exit 1
+        }
+        Write-Host "All smoke tests passed."
     - name: upload artifact
       uses: actions/upload-artifact@v4
       with:
